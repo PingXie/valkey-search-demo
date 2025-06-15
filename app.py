@@ -249,14 +249,29 @@ def search():
         Query(q_str)
         .return_fields("id", "embedding")
         .dialect(2)
-        .sort_by("__embedding_score")
     )
     res = valkey_client.ft("products").search(query_obj, {"user_vec": user["embedding"]})
 
-    candidate_ids = [f"product:{doc.id}" for doc in res.docs]
-    candidate_embs = [np.frombuffer(doc.embedding, dtype=np.float32) for doc in res.docs if doc.embedding]
+    # Now that we have the IDs, we fetch the embeddings separately using a pipeline.
+    # HGETALL/HGET correctly returns raw bytes, avoiding the bug.
+    candidate_ids = [f"{doc.id}" for doc in res.docs]
+    pipe = valkey_client.pipeline(transaction=False)
+    for pid in candidate_ids:
+        pipe.hget(pid, "embedding")
+    embedding_blobs = pipe.execute()
 
-    if candidate_ids and candidate_embs:
+    # Filter out any products that might not have an embedding
+    # and convert the valid byte blobs into numpy arrays
+    candidate_embs = [
+        np.frombuffer(emb, dtype=np.float32)
+        for emb in embedding_blobs if emb
+    ]
+    # We also need to filter the IDs list to keep it in sync
+    valid_candidate_ids = [
+        pid for pid, emb in zip(candidate_ids, embedding_blobs) if emb
+    ]
+
+    if valid_candidate_ids and candidate_embs:
         selected_indices = mmr_rerank(
             np.frombuffer(user["embedding"], dtype=np.float32),
             candidate_embs,
