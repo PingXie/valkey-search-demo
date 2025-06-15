@@ -3,39 +3,41 @@ import os
 import json
 import base64
 import threading
+import random
 import numpy as np
+
+# Valkey imports
 import valkey
 from valkey.cluster import ValkeyCluster, ClusterNode
+from valkey.commands.search.query import Query
+
+# Flask imports
 from flask import Flask, render_template, request, redirect, url_for, session
 
-# --- AI and Helper Imports ---
+# Google Cloud Vertex AI import
 import vertexai
-from vertexai.generative_models import GenerativeModel, Part
+from vertexai.generative_models import GenerativeModel
 
 # --- App Initialization ---
 app = Flask(__name__)
 
 # --- CENTRALIZED FLASK CONFIGURATION ---
-# Load configuration from environment variables into Flask's app.config
-# This is the "Flask way" to handle configuration.
 app.config['SECRET_KEY'] = os.getenv("FLASK_SECRET_KEY", "a-very-secret-key-for-demo-purposes")
 app.config['VALKEY_HOST'] = os.getenv("VALKEY_HOST", "localhost")
 app.config['VALKEY_PORT'] = int(os.getenv("VALKEY_PORT", 6379))
 app.config['VALKEY_IS_CLUSTER'] = os.getenv("VALKEY_IS_CLUSTER", "false").lower() == "true"
 app.config['GCP_PROJECT'] = os.getenv("GCP_PROJECT")
 app.config['GCP_LOCATION'] = "us-central1"
+# We keep a valid model name here, even if it fails, for future use.
 app.config['GEMINI_MODEL_NAME'] = "gemini-1.5-flash-001"
 app.config['VECTOR_DIM'] = 768
 
 
 # --- Reusable Clients ---
 def get_valkey_connection():
-    """Gets a Valkey connection, supporting both standalone and cluster modes."""
-    # CHANGED: Reads from app.config instead of global variables
     is_cluster = app.config['VALKEY_IS_CLUSTER']
     host = app.config['VALKEY_HOST']
     port = app.config['VALKEY_PORT']
-    
     print(f"Connecting to Valkey (Cluster mode: {is_cluster})...")
     if is_cluster:
         startup_nodes = [ClusterNode(host=host, port=port)]
@@ -44,24 +46,25 @@ def get_valkey_connection():
         return valkey.Valkey(host=host, port=port)
 
 def get_gemini_model():
-    """Initializes and returns the Gemini model client."""
-    # CHANGED: Reads from app.config instead of global variables
-    vertexai.init(project=app.config['GCP_PROJECT'], location=app.config['GCP_LOCATION'])
-    return GenerativeModel(app.config['GEMINI_MODEL_NAME'])
+    try:
+        if not app.config['GCP_PROJECT']:
+            print("WARNING: GCP_PROJECT environment variable not set. Gemini client will not be initialized.")
+            return None
+        vertexai.init(project=app.config['GCP_PROJECT'], location=app.config['GCP_LOCATION'])
+        return GenerativeModel(app.config['GEMINI_MODEL_NAME'])
+    except Exception as e:
+        print(f"WARNING: Could not initialize Vertex AI. AI features will be disabled. Details: {e}")
+        return None
 
 valkey_client = get_valkey_connection()
-gemini_model = get_gemini_model()
+gemini_model = get_gemini_model() # Will be None if initialization fails
 
-# --- The rest of the script (all routes and helpers) remains exactly the same. ---
-# --- They will now implicitly use the clients that were configured above. ---
 
+# --- Helper Functions ---
 def get_user_profile(user_id):
-    """Retrieves a user profile hash from Valkey."""
-    if not user_id:
-        return None
+    if not user_id: return None
     user_key = f"user:{user_id}"
     user_data = valkey_client.hgetall(user_key)
-    # Manually decode text fields, leave embedding and avatar as is
     if user_data:
         return {
             "id": user_id,
@@ -73,22 +76,21 @@ def get_user_profile(user_id):
     return None
 
 def get_products_by_ids(product_ids):
-    """Retrieves multiple product hashes from Valkey."""
+    if not product_ids: return []
     pipe = valkey_client.pipeline(transaction=False)
     for pid in product_ids:
-        pipe.hgetall(pid)
+        key = pid if isinstance(pid, bytes) else pid.encode('utf-8')
+        pipe.hgetall(key)
     results = pipe.execute()
     
     products = []
     for data in results:
         if data:
-            # Convert binary image blob to a Data URI for direct HTML rendering
             img_blob = data.get(b'image_blob')
             img_uri = ""
             if img_blob:
                 b64_img = base64.b64encode(img_blob).decode('utf-8')
                 img_uri = f"data:image/png;base64,{b64_img}"
-
             products.append({
                 "id": data.get(b'id', b'').decode('utf-8'),
                 "name": data.get(b'name', b'').decode('utf-8'),
@@ -101,57 +103,63 @@ def get_products_by_ids(product_ids):
     return products
 
 def get_personalized_descriptions_async(user_profile, products):
-    """
-    A function designed to run in a background thread to call Gemini
-    and cache the results without blocking the main web request.
-    """
     def generate_and_cache():
+        # If the gemini model failed to initialize, don't even try to run.
+        if not gemini_model:
+            print("INFO: Gemini client not available. Skipping personalized description generation.")
+            return
+
         for product in products:
             product_id_num = product['id']
             cache_key = f"llm_cache:user:{user_profile['id']}:product:{product_id_num}"
-            
-            # 1. Check cache first
             if valkey_client.exists(cache_key):
-                print(f"CACHE HIT for {cache_key}")
+                print(f"INFO: CACHE HIT for {cache_key}")
                 continue
             
-            print(f"CACHE MISS for {cache_key}. Calling Gemini...")
-            # 2. If not in cache, call Gemini
+            print(f"INFO: CACHE MISS for {cache_key}. Attempting to call Gemini...")
             try:
                 prompt = (
-                    f"You are a helpful and persuasive sales assistant. "
-                    f"A user named {user_profile['name']} is looking at the following product: '{product['name']}'. "
-                    f"The user's bio is: '{user_profile['bio']}'. "
-                    f"Based on the user's bio, write a short, exciting, and personalized one-paragraph sales pitch for this specific product that directly addresses their interests. "
-                    f"Do not use markdown."
+                    f"You are a helpful and persuasive sales assistant. A user named {user_profile['name']} "
+                    f"is looking at the product: '{product['name']}'. The user's bio is: '{user_profile['bio']}'. "
+                    f"Based on their bio, write a short, exciting, personalized one-paragraph sales pitch for this product that directly addresses their interests. Do not use markdown."
                 )
                 response = gemini_model.generate_content(prompt)
                 
-                # 3. Cache the result with a 2-hour TTL
                 if response and response.text:
-                    valkey_client.set(cache_key, response.text, ex=7200) # ex=7200 seconds -> 2 hours
-                    print(f"SUCCESS: Cached Gemini response for {cache_key}")
-            except Exception as e:
-                print(f"ERROR: Failed to call Gemini or cache result for {cache_key}. Details: {e}")
+                    description = response.text
+                    print(f"INFO: Successfully received response from Gemini for {cache_key}")
+                else:
+                    raise ValueError("Received an empty response from Gemini.")
 
-    # Start the background thread
+            except Exception as e:
+                # --- MODIFIED BEHAVIOR ---
+                # If the API call fails, log the error and create a mock response.
+                print(f"WARNING: Gemini API call failed. Details: {e}")
+                print(f"INFO: Generating a mock personalized description for demo purposes.")
+                description = (
+                    f"For a savvy individual like {user_profile['name']}, the {product['name']} stands out as a premier choice. "
+                    f"Its robust feature set aligns perfectly with your interests, ensuring it will "
+                    f"not only meet but exceed your expectations for quality and performance."
+                )
+            
+            # Cache the result (either real or mock) with a 2-hour TTL
+            valkey_client.set(cache_key, description, ex=7200)
+            print(f"INFO: Cached description for {cache_key}")
+
     thread = threading.Thread(target=generate_and_cache)
     thread.start()
 
-# --- Routes ---
+# --- All Routes remain the same as the last correct version ---
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
         user_id = request.form.get("user_id")
         password = request.form.get("password")
-        
-        # In this demo, we accept any password but check if the user exists
         if user_id and password and get_user_profile(user_id):
             session["user_id"] = user_id
             return redirect(url_for("home"))
         else:
             return render_template("login.html", error="Invalid user ID. Try 101 or 102.")
-
     return render_template("login.html")
 
 @app.route("/logout")
@@ -163,120 +171,81 @@ def logout():
 @app.route("/home")
 def home():
     user_id = session.get("user_id")
-    if not user_id:
-        return redirect(url_for("login"))
-    
+    if not user_id: return redirect(url_for("login"))
     user_profile = get_user_profile(user_id)
-    
-    # Get 5 random product keys from the database
-    # To do this robustly in a cluster, we get all keys and sample them.
-    # Note: In a massive database, a different approach like a dedicated set would be better.
     all_product_keys = [key for key in valkey_client.scan_iter("product:*")]
     sample_size = min(5, len(all_product_keys))
     random_product_keys = random.sample(all_product_keys, sample_size)
-    
     products = get_products_by_ids(random_product_keys)
-    
-    # In the background, start generating personalized descriptions for these products
     if user_profile and products:
         get_personalized_descriptions_async(user_profile, products)
-    
     return render_template("home.html", user=user_profile, products=products)
 
 @app.route("/search", methods=["POST"])
 def search():
     user_id = session.get("user_id")
-    if not user_id:
-        return redirect(url_for("login"))
-    
+    if not user_id: return redirect(url_for("login"))
     user_profile = get_user_profile(user_id)
     query_text = request.form.get("query", "").strip()
-    
-    if not query_text:
-        return redirect(url_for("home"))
+    if not query_text: return redirect(url_for("home"))
 
-    # Build the hybrid query
-    # 1. Prepare tag filters from keywords
     keywords = query_text.lower().split()
     tag_filter = " ".join([f"@search_tags:{{{keyword}}}" for keyword in keywords])
-    
-    # 2. Prepare the full hybrid query string
-    # We are finding the 5 products that best match the tags AND are closest to the user's interest vector
     query_string = f"({tag_filter})=>[KNN 5 @embedding $user_vec]"
     
-    # 3. Define the query object
     query = (
-        valkey.search.Query(query_string)
-        .return_fields("id", "name", "brand", "price", "rating", "link")
+        Query(query_string)
+        .return_field("id")
         .dialect(2)
-        .sort_by("__embedding_score") # Sort by vector similarity score
+        .sort_by("__embedding_score")
     )
     
-    # 4. Execute the query with the user's embedding as a parameter
     query_params = {"user_vec": user_profile["embedding"]}
-    # Use the ft() method on the client to specify the index name
-    results = valkey_client.ft("products").search(query, query_params)
-    
-    # 5. Process results
-    product_ids = [f"product:{doc.id}" for doc in results.docs]
-    products = get_products_by_ids(product_ids)
-    
-    # 6. Start the async LLM task for the search results
+    try:
+        results = valkey_client.ft("products").search(query, query_params)
+        product_ids = [doc.id for doc in results.docs]
+        products = get_products_by_ids(product_ids)
+    except Exception as e:
+        print(f"Search query failed: {e}")
+        products = []
+
     if user_profile and products:
         get_personalized_descriptions_async(user_profile, products)
-        
     return render_template("home.html", user=user_profile, products=products, search_query=query_text)
 
 @app.route("/product/<product_id>")
 def product_detail(product_id):
     user_id = session.get("user_id")
-    if not user_id:
-        return redirect(url_for("login"))
-    
+    if not user_id: return redirect(url_for("login"))
     user_profile = get_user_profile(user_id)
     product_key = f"product:{product_id}"
 
-    # Get the main product's details
     product_list = get_products_by_ids([product_key])
-    if not product_list:
-        return "Product not found", 404
+    if not product_list: return "Product not found", 404
     product = product_list[0]
     
-    # Get the cached personalized description
     cache_key = f"llm_cache:user:{user_id}:product:{product_id}"
     personalized_description_bytes = valkey_client.get(cache_key)
     if personalized_description_bytes:
         product['personalized_description'] = personalized_description_bytes.decode('utf-8')
     else:
-        # You could optionally trigger a blocking call here if you want to guarantee a description
+        print(f"INFO: No cached description found for {cache_key}. Using default text.")
         product['personalized_description'] = "A great choice for anyone looking for quality and value."
 
-    # --- Find Similar Products (Two ways) ---
-    
-    # 1. Similarity based on the current product's vector
-    product_embedding = valkey_client.hget(product_key, "embedding")
-    # Use a generic ft() object from the main client
     ft = valkey_client.ft("products")
+    product_embedding_bytes = valkey_client.hget(product_key.encode('utf-8'), "embedding")
     
-    q_product = (
-        valkey.search.Query("*=>[KNN 6 @embedding $product_vec]")
-        .return_field("id")
-        .dialect(2)
-    )
-    results_prod_similar = ft.search(q_product, {"product_vec": product_embedding})
-    # Exclude the product itself from its own similarity list
-    similar_prod_ids = [f"product:{doc.id}" for doc in results_prod_similar.docs if doc.id != product_id][:5]
-    similar_products = get_products_by_ids(similar_prod_ids)
+    # Check if embedding exists before trying to query with it
+    similar_products = []
+    if product_embedding_bytes:
+        q_product = (Query("*=>[KNN 6 @embedding $product_vec]").return_field("id").dialect(2))
+        results_prod_similar = ft.search(q_product, {"product_vec": product_embedding_bytes})
+        similar_prod_ids = [doc.id for doc in results_prod_similar.docs if doc.id != product_id][:5]
+        similar_products = get_products_by_ids(similar_prod_ids)
 
-    # 2. Similarity based on the user's vector (Personalized Recommendations)
-    q_user = (
-        valkey.search.Query("*=>[KNN 6 @embedding $user_vec]")
-        .return_field("id")
-        .dialect(2)
-    )
+    q_user = (Query("*=>[KNN 6 @embedding $user_vec]").return_field("id").dialect(2))
     results_user_similar = ft.search(q_user, {"user_vec": user_profile["embedding"]})
-    # Exclude the current product if it appears in the list
-    recommended_prod_ids = [f"product:{doc.id}" for doc in results_user_similar.docs if doc.id != product_id][:5]
+    recommended_prod_ids = [doc.id for doc in results_user_similar.docs if doc.id != product_id][:5]
     recommended_products = get_products_by_ids(recommended_prod_ids)
     
     return render_template(
@@ -288,5 +257,4 @@ def product_detail(product_id):
     )
 
 if __name__ == "__main__":
-    # Note: For production, use a proper WSGI server like Gunicorn or uWSGI
     app.run(debug=True, host='0.0.0.0', port=5001)
