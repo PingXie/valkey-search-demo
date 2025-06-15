@@ -1,0 +1,25 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container">
+    {% if search_query %}
+        <h2>Search Results for "{{ search_query }}"</h2>
+    {% else %}
+        <h2>Discover Products</h2>
+    {% endif %}
+
+    <div class="product-grid">
+        {% for product in products %}
+        <a href="{{ url_for('product_detail', product_id=product.id) }}" class="product-card">
+            <img src="{{ product.thumbnail }}" alt="{{ product.name }}" class="product-thumbnail">
+            <div class="product-info">
+                <p class="product-brand">{{ product.brand }}</p>
+                <h3 class="product-name">{{ product.name }}</h3>
+                <p class="product-price">₹ {{ "%.2f"|format(product.price|float) }}</p>
+            </div>
+        </a>
+        {% else %}
+        <p>No products found.</p>
+        {% endfor %}
+    </div>
+</div>
+{% endblock %}

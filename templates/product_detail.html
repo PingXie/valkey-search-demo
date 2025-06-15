@@ -1,0 +1,54 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="container product-detail-container">
+    <div class="product-main">
+        <div class="product-image-container">
+            <img src="{{ product.thumbnail }}" alt="{{ product.name }}" class="product-detail-image">
+        </div>
+        <div class="product-main-info">
+            <p class="product-brand">{{ product.brand }}</p>
+            <h1>{{ product.name }}</h1>
+            <p class="product-price">₹ {{ "%.2f"|format(product.price|float) }}</p>
+            
+            <div class="personalized-pitch">
+                <h3>A Great Choice For You!</h3>
+                <p>{{ product.personalized_description }}</p>
+            </div>
+
+            <a href="{{ product.link }}" target="_blank" class="buy-button">View on Amazon</a>
+        </div>
+    </div>
+
+    <div class="recommendations">
+        <hr>
+        <h3>Similar Products</h3>
+        <div class="product-grid">
+            {% for p in similar_products %}
+            <a href="{{ url_for('product_detail', product_id=p.id) }}" class="product-card">
+                <img src="{{ p.thumbnail }}" alt="{{ p.name }}" class="product-thumbnail">
+                <div class="product-info">
+                    <p class="product-brand">{{ p.brand }}</p>
+                    <h3 class="product-name">{{ p.name }}</h3>
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+    
+    <div class="recommendations">
+        <hr>
+        <h3>Recommended For You</h3>
+        <div class="product-grid">
+            {% for p in recommended_products %}
+            <a href="{{ url_for('product_detail', product_id=p.id) }}" class="product-card">
+                <img src="{{ p.thumbnail }}" alt="{{ p.name }}" class="product-thumbnail">
+                <div class="product-info">
+                    <p class="product-brand">{{ p.brand }}</p>
+                    <h3 class="product-name">{{ p.name }}</h3>
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Valkey VSS Demo</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header>
+        <div class="logo">
+            <a href="{{ url_for('home') }}">Valkey VSS Demo</a>
+        </div>
+        {% if user %}
+        <div class="header-right">
+            <form action="{{ url_for('search') }}" method="post" class="search-form">
+                <input type="search" name="query" placeholder="Search by keywords..." value="{{ search_query or '' }}" required>
+                <button type="submit">Search</button>
+            </form>
+            <div class="user-info">
+                <span>{{ user.name }}</span>
+                <div class="avatar-dropdown">
+                    <img src="{{ user.avatar }}" alt="User Avatar" class="avatar-img">
+                    <div class="dropdown-content">
+                        <a href="{{ url_for('logout') }}">Logout</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </header>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+</body>
+</html>
