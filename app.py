@@ -310,7 +310,7 @@ def product_detail(product_id):
     if product_emb_bytes:
         q_prod = (Query("*=>[KNN 6 @embedding $product_vec]").return_field("id").dialect(2))
         res_sim = ft.search(q_prod, {"product_vec": product_emb_bytes})
-        sim_ids = [f"product:{d.id}" for d in res_sim.docs if d.id != product_id][:5]
+        sim_ids = [f"{d.id}" for d in res_sim.docs if d.id != product_id][:5]
         similar_products = get_products_by_ids(sim_ids)
 
     q_user = Query("*=>[KNN 25 @embedding $user_vec]").return_field("id").dialect(2)
@@ -321,7 +321,7 @@ def product_detail(product_id):
     for d in res_user.docs:
         if d.id == product_id:
             continue
-        pid = f"product:{d.id}"
+        pid = f"{d.id}"
         e = valkey_client.hget(pid.encode('utf-8'), "embedding")
         if e:
             candidate_ids.append(pid)
