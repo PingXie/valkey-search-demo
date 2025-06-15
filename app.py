@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import os
-import json
 import base64
 import threading
 import random
 import numpy as np
+import argparse
+import json
 
 # Valkey imports
 import valkey
@@ -14,152 +15,201 @@ from valkey.commands.search.query import Query
 # Flask imports
 from flask import Flask, render_template, request, redirect, url_for, session
 
-# Google Cloud Vertex AI import
-import vertexai
-from vertexai.generative_models import GenerativeModel
+from google import genai
+from google.genai import types
 
-# --- App Initialization ---
+# --- App Initialization & Argument Parsing ---
 app = Flask(__name__)
+# Use parse_known_args to ensure Flask's own arguments don't cause an error
+parser = argparse.ArgumentParser(description="Valkey VSS Demo with Flask and Gemini.")
+parser.add_argument('--cluster', action='store_true', help="Enable cluster mode for connecting to a Valkey Cluster.")
+cli_args, _ = parser.parse_known_args()
+
 
 # --- CENTRALIZED FLASK CONFIGURATION ---
 app.config['SECRET_KEY'] = os.getenv("FLASK_SECRET_KEY", "a-very-secret-key-for-demo-purposes")
 app.config['VALKEY_HOST'] = os.getenv("VALKEY_HOST", "localhost")
 app.config['VALKEY_PORT'] = int(os.getenv("VALKEY_PORT", 6379))
-app.config['VALKEY_IS_CLUSTER'] = os.getenv("VALKEY_IS_CLUSTER", "false").lower() == "true"
+app.config['VALKEY_IS_CLUSTER'] = cli_args.cluster
 app.config['GCP_PROJECT'] = os.getenv("GCP_PROJECT")
 app.config['GCP_LOCATION'] = "us-central1"
-# We keep a valid model name here, even if it fails, for future use.
-app.config['GEMINI_MODEL_NAME'] = "gemini-1.5-flash-001"
+app.config['GEMINI_MODEL_NAME'] = "gemini-2.5-flash-preview-05-20"
 app.config['VECTOR_DIM'] = 768
 
 
-# --- Reusable Clients ---
+# --- Client Initialization ---
 def get_valkey_connection():
     is_cluster = app.config['VALKEY_IS_CLUSTER']
     host = app.config['VALKEY_HOST']
     port = app.config['VALKEY_PORT']
     print(f"Connecting to Valkey (Cluster mode: {is_cluster})...")
-    if is_cluster:
-        startup_nodes = [ClusterNode(host=host, port=port)]
-        return ValkeyCluster(startup_nodes=startup_nodes)
-    else:
-        return valkey.Valkey(host=host, port=port)
+    try:
+        if is_cluster:
+            client = ValkeyCluster(startup_nodes=[ClusterNode(host=host, port=port)])
+        else:
+            client = valkey.Valkey(host=host, port=port)
+        client.ping()
+        print(f"Successfully connected to Valkey.")
+        return client
+    except Exception as e:
+        print(f"FATAL: Could not connect to Valkey. Please check the server. Error: {e}")
+        return None
 
-def get_gemini_model():
+def get_gemini_client():
+    """Initializes and returns the new google.genai client."""
     try:
         if not app.config['GCP_PROJECT']:
-            print("WARNING: GCP_PROJECT environment variable not set. Gemini client will not be initialized.")
+            print("WARNING: GCP_PROJECT not set. Gemini features will be mocked.")
             return None
-        vertexai.init(project=app.config['GCP_PROJECT'], location=app.config['GCP_LOCATION'])
-        return GenerativeModel(app.config['GEMINI_MODEL_NAME'])
+        print(f"Initializing google.genai client for project '{app.config['GCP_PROJECT']}'...")
+        return genai.Client(
+            vertexai=True,
+            project=app.config['GCP_PROJECT'],
+            location=app.config['GCP_LOCATION']
+        )
     except Exception as e:
-        print(f"WARNING: Could not initialize Vertex AI. AI features will be disabled. Details: {e}")
+        print(f"WARNING: Could not initialize Vertex AI client. Gemini features will be mocked. Details: {e}")
         return None
 
 valkey_client = get_valkey_connection()
-gemini_model = get_gemini_model() # Will be None if initialization fails
+gemini_client = get_gemini_client()
 
 
-# --- Helper Functions ---
+# --- MMR Reranking Helper ---
+def mmr_rerank(query_embedding, candidate_embeddings, lambda_param=0.7, top_n=5):
+    """Performs Maximal Marginal Relevance reranking to diversify results."""
+    if not candidate_embeddings:
+        return []
+
+    selected_indices = []
+    candidate_indices = list(range(len(candidate_embeddings)))
+
+    q_emb = query_embedding / np.linalg.norm(query_embedding)
+    cand_embs = np.array(candidate_embeddings)
+    cand_embs = cand_embs / np.linalg.norm(cand_embs, axis=1, keepdims=True)
+
+    relevance_scores = cand_embs @ q_emb
+
+    if candidate_indices:
+        best_idx_pos = np.argmax(relevance_scores)
+        selected_indices.append(candidate_indices.pop(best_idx_pos))
+
+    while len(selected_indices) < top_n and candidate_indices:
+        mmr_scores = {}
+        selected_embeddings = cand_embs[selected_indices]
+
+        for i in candidate_indices:
+            relevance = relevance_scores[i]
+            diversity = np.max(cand_embs[i] @ selected_embeddings.T)
+            mmr_scores[i] = lambda_param * relevance - (1 - lambda_param) * diversity
+
+        if not mmr_scores: break
+        best_candidate_idx = max(mmr_scores, key=mmr_scores.get)
+        selected_indices.append(best_candidate_idx)
+        candidate_indices.remove(best_candidate_idx)
+
+    return selected_indices
+
+
+# --- Data Helpers ---
 def get_user_profile(user_id):
-    if not user_id: return None
-    user_key = f"user:{user_id}"
-    user_data = valkey_client.hgetall(user_key)
-    if user_data:
-        return {
-            "id": user_id,
-            "name": user_data.get(b'name', b'').decode('utf-8'),
-            "bio": user_data.get(b'bio', b'').decode('utf-8'),
-            "avatar": user_data.get(b'avatar', b'').decode('utf-8'),
-            "embedding": user_data.get(b'embedding'),
-        }
-    return None
+    if not user_id:
+        return None
+    data = valkey_client.hgetall(f"user:{user_id}")
+    if not data:
+        return None
+    return {
+        "id":        user_id,
+        "name":      data.get(b'name', b'').decode(),
+        "bio":       data.get(b'bio', b'').decode(),
+        "avatar":    data.get(b'avatar', b'').decode(),
+        "embedding": data.get(b'embedding'),
+    }
 
-def get_products_by_ids(product_ids):
-    if not product_ids: return []
+def get_products_by_ids(ids):
+    if not ids:
+        return []
     pipe = valkey_client.pipeline(transaction=False)
-    for pid in product_ids:
+    for pid in ids:
         key = pid if isinstance(pid, bytes) else pid.encode('utf-8')
         pipe.hgetall(key)
     results = pipe.execute()
-    
-    products = []
-    for data in results:
-        if data:
-            img_blob = data.get(b'image_blob')
-            img_uri = ""
-            if img_blob:
-                b64_img = base64.b64encode(img_blob).decode('utf-8')
-                img_uri = f"data:image/png;base64,{b64_img}"
-            products.append({
-                "id": data.get(b'id', b'').decode('utf-8'),
-                "name": data.get(b'name', b'').decode('utf-8'),
-                "brand": data.get(b'brand', b'').decode('utf-8'),
-                "price": data.get(b'price', b'').decode('utf-8'),
-                "rating": data.get(b'rating', b'').decode('utf-8'),
-                "link": data.get(b'link', b'').decode('utf-8'),
-                "thumbnail": img_uri
-            })
-    return products
 
+    prods = []
+    for data in results:
+        if not data:
+            continue
+        img_blob = data.get(b'image_blob')
+        thumb = ""
+        if img_blob:
+            thumb = "data:image/png;base64," + base64.b64encode(img_blob).decode()
+        prods.append({
+            "id":    data.get(b'id', b'').decode(),
+            "name":  data.get(b'name', b'').decode(),
+            "brand": data.get(b'brand', b'').decode(),
+            "price": data.get(b'price', b'').decode(),
+            "rating": data.get(b'rating', b'').decode(),
+            "link":  data.get(b'link', b'').decode(),
+            "thumbnail": thumb
+        })
+    return prods
+
+# --- Async LLM Descriptions ---
 def get_personalized_descriptions_async(user_profile, products):
-    def generate_and_cache():
-        # If the gemini model failed to initialize, don't even try to run.
-        if not gemini_model:
-            print("INFO: Gemini client not available. Skipping personalized description generation.")
+    def task():
+        if not gemini_client:
+            print("INFO: Gemini client not available, skipping description generation.")
             return
 
         for product in products:
-            product_id_num = product['id']
-            cache_key = f"llm_cache:user:{user_profile['id']}:product:{product_id_num}"
+            cache_key = f"llm_cache:user:{user_profile['id']}:product:{product['id']}"
             if valkey_client.exists(cache_key):
-                print(f"INFO: CACHE HIT for {cache_key}")
+                print(f"INFO: Cache hit for {cache_key}")
                 continue
-            
-            print(f"INFO: CACHE MISS for {cache_key}. Attempting to call Gemini...")
-            try:
-                prompt = (
-                    f"You are a helpful and persuasive sales assistant. A user named {user_profile['name']} "
-                    f"is looking at the product: '{product['name']}'. The user's bio is: '{user_profile['bio']}'. "
-                    f"Based on their bio, write a short, exciting, personalized one-paragraph sales pitch for this product that directly addresses their interests. Do not use markdown."
-                )
-                response = gemini_model.generate_content(prompt)
-                
-                if response and response.text:
-                    description = response.text
-                    print(f"INFO: Successfully received response from Gemini for {cache_key}")
-                else:
-                    raise ValueError("Received an empty response from Gemini.")
 
-            except Exception as e:
-                # --- MODIFIED BEHAVIOR ---
-                # If the API call fails, log the error and create a mock response.
-                print(f"WARNING: Gemini API call failed. Details: {e}")
-                print(f"INFO: Generating a mock personalized description for demo purposes.")
-                description = (
-                    f"For a savvy individual like {user_profile['name']}, the {product['name']} stands out as a premier choice. "
-                    f"Its robust feature set aligns perfectly with your interests, ensuring it will "
-                    f"not only meet but exceed your expectations for quality and performance."
+            print(f"INFO: Cache miss for {cache_key}. Attempting to call Gemini...")
+            prompt = (
+                f"You are a helpful and persuasive sales assistant. "
+                f"A user named {user_profile['name']} is looking at '{product['name']}'. "
+                f"Their bio is: '{user_profile['bio']}'. "
+                f"Write a short, exciting, personalized paragraph addressing their interests. No markdown."
+            )
+            try:
+                model_name = app.config['GEMINI_MODEL_NAME']
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt]
                 )
-            
-            # Cache the result (either real or mock) with a 2-hour TTL
-            valkey_client.set(cache_key, description, ex=7200)
+                desc = response.text if response and response.text else None
+                if not desc:
+                    raise ValueError("Received an empty response from Gemini.")
+                print(f"INFO: Successfully received response from Gemini for {cache_key}")
+            except Exception as e:
+                print(f"WARNING: Gemini API call failed, using mock response. Details: {e}")
+                desc = (
+                    f"For a savvy individual like {user_profile['name']}, the {product['name']} "
+                    f"stands out with its robust features that align perfectly with your unique interests and needs."
+                )
+            valkey_client.set(cache_key, desc, ex=7200) # Cache for 2 hours
             print(f"INFO: Cached description for {cache_key}")
 
-    thread = threading.Thread(target=generate_and_cache)
-    thread.start()
+    threading.Thread(target=task).start()
 
-# --- All Routes remain the same as the last correct version ---
+# --- Routes ---
+@app.before_request
+def check_connection():
+    if not valkey_client:
+        return "Error: Could not connect to Valkey. Please check the server and your connection settings.", 503
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        user_id = request.form.get("user_id")
-        password = request.form.get("password")
-        if user_id and password and get_user_profile(user_id):
-            session["user_id"] = user_id
+        uid = request.form.get("user_id")
+        pwd = request.form.get("password")
+        if uid and pwd and get_user_profile(uid):
+            session["user_id"] = uid
             return redirect(url_for("home"))
-        else:
-            return render_template("login.html", error="Invalid user ID. Try 101 or 102.")
+        return render_template("login.html", error="Invalid user ID. Try 101 or 102.")
     return render_template("login.html")
 
 @app.route("/logout")
@@ -170,87 +220,108 @@ def logout():
 @app.route("/")
 @app.route("/home")
 def home():
-    user_id = session.get("user_id")
-    if not user_id: return redirect(url_for("login"))
-    user_profile = get_user_profile(user_id)
-    all_product_keys = [key for key in valkey_client.scan_iter("product:*")]
-    sample_size = min(5, len(all_product_keys))
-    random_product_keys = random.sample(all_product_keys, sample_size)
-    products = get_products_by_ids(random_product_keys)
-    if user_profile and products:
-        get_personalized_descriptions_async(user_profile, products)
-    return render_template("home.html", user=user_profile, products=products)
+    uid = session.get("user_id")
+    if not uid:
+        return redirect(url_for("login"))
+    user = get_user_profile(uid)
+    keys = list(valkey_client.scan_iter("product:*"))
+    picks = random.sample(keys, min(5, len(keys)))
+    products = get_products_by_ids(picks)
+    if user and products:
+        get_personalized_descriptions_async(user, products)
+    return render_template("home.html", user=user, products=products)
 
 @app.route("/search", methods=["POST"])
 def search():
-    user_id = session.get("user_id")
-    if not user_id: return redirect(url_for("login"))
-    user_profile = get_user_profile(user_id)
+    uid = session.get("user_id")
+    if not uid:
+        return redirect(url_for("login"))
+    user = get_user_profile(uid)
     query_text = request.form.get("query", "").strip()
-    if not query_text: return redirect(url_for("home"))
+    if not query_text:
+        return redirect(url_for("home"))
 
-    keywords = query_text.lower().split()
-    tag_filter = " ".join([f"@search_tags:{{{keyword}}}" for keyword in keywords])
-    query_string = f"({tag_filter})=>[KNN 5 @embedding $user_vec]"
-    
-    query = (
-        Query(query_string)
-        .return_field("id")
+    tags = query_text.lower().split()
+    tag_filter = " ".join(f"@search_tags:{{{t}}}" for t in tags)
+
+    q_str = f"({tag_filter})=>[KNN 25 @embedding $user_vec]"
+    query_obj = (
+        Query(q_str)
+        .return_fields("id", "embedding")
         .dialect(2)
         .sort_by("__embedding_score")
     )
-    
-    query_params = {"user_vec": user_profile["embedding"]}
-    try:
-        results = valkey_client.ft("products").search(query, query_params)
-        product_ids = [doc.id for doc in results.docs]
-        products = get_products_by_ids(product_ids)
-    except Exception as e:
-        print(f"Search query failed: {e}")
+    res = valkey_client.ft("products").search(query_obj, {"user_vec": user["embedding"]})
+
+    candidate_ids = [f"product:{doc.id}" for doc in res.docs]
+    candidate_embs = [np.frombuffer(doc.embedding, dtype=np.float32) for doc in res.docs if doc.embedding]
+
+    if candidate_ids and candidate_embs:
+        selected_indices = mmr_rerank(
+            np.frombuffer(user["embedding"], dtype=np.float32),
+            candidate_embs,
+            lambda_param=0.7,
+            top_n=5
+        )
+        final_ids = [candidate_ids[i] for i in selected_indices]
+        products = get_products_by_ids(final_ids)
+    else:
         products = []
 
-    if user_profile and products:
-        get_personalized_descriptions_async(user_profile, products)
-    return render_template("home.html", user=user_profile, products=products, search_query=query_text)
+    if user and products:
+        get_personalized_descriptions_async(user, products)
+    return render_template("home.html", user=user, products=products, search_query=query_text)
 
 @app.route("/product/<product_id>")
 def product_detail(product_id):
-    user_id = session.get("user_id")
-    if not user_id: return redirect(url_for("login"))
-    user_profile = get_user_profile(user_id)
-    product_key = f"product:{product_id}"
+    uid = session.get("user_id")
+    if not uid:
+        return redirect(url_for("login"))
+    user = get_user_profile(uid)
+    key = f"product:{product_id}"
+    items = get_products_by_ids([key])
+    if not items:
+        return "Not found", 404
+    product = items[0]
 
-    product_list = get_products_by_ids([product_key])
-    if not product_list: return "Product not found", 404
-    product = product_list[0]
-    
-    cache_key = f"llm_cache:user:{user_id}:product:{product_id}"
-    personalized_description_bytes = valkey_client.get(cache_key)
-    if personalized_description_bytes:
-        product['personalized_description'] = personalized_description_bytes.decode('utf-8')
-    else:
-        print(f"INFO: No cached description found for {cache_key}. Using default text.")
-        product['personalized_description'] = "A great choice for anyone looking for quality and value."
+    cache_key = f"llm_cache:user:{uid}:product:{product_id}"
+    desc = valkey_client.get(cache_key)
+    product['personalized_description'] = desc.decode() if desc else "A great choice that combines quality and value."
 
     ft = valkey_client.ft("products")
-    product_embedding_bytes = valkey_client.hget(product_key.encode('utf-8'), "embedding")
-    
-    # Check if embedding exists before trying to query with it
-    similar_products = []
-    if product_embedding_bytes:
-        q_product = (Query("*=>[KNN 6 @embedding $product_vec]").return_field("id").dialect(2))
-        results_prod_similar = ft.search(q_product, {"product_vec": product_embedding_bytes})
-        similar_prod_ids = [doc.id for doc in results_prod_similar.docs if doc.id != product_id][:5]
-        similar_products = get_products_by_ids(similar_prod_ids)
+    product_emb_bytes = valkey_client.hget(key.encode('utf-8'), "embedding")
 
-    q_user = (Query("*=>[KNN 6 @embedding $user_vec]").return_field("id").dialect(2))
-    results_user_similar = ft.search(q_user, {"user_vec": user_profile["embedding"]})
-    recommended_prod_ids = [doc.id for doc in results_user_similar.docs if doc.id != product_id][:5]
-    recommended_products = get_products_by_ids(recommended_prod_ids)
-    
+    similar_products = []
+    if product_emb_bytes:
+        q_prod = (Query("*=>[KNN 6 @embedding $product_vec]").return_field("id").dialect(2))
+        res_sim = ft.search(q_prod, {"product_vec": product_emb_bytes})
+        sim_ids = [f"product:{d.id}" for d in res_sim.docs if d.id != product_id][:5]
+        similar_products = get_products_by_ids(sim_ids)
+
+    q_user = Query("*=>[KNN 25 @embedding $user_vec]").return_field("id").dialect(2)
+    res_user = ft.search(q_user, {"user_vec": user["embedding"]})
+
+    candidate_ids = []
+    candidate_embs = []
+    for d in res_user.docs:
+        if d.id == product_id:
+            continue
+        pid = f"product:{d.id}"
+        e = valkey_client.hget(pid.encode('utf-8'), "embedding")
+        if e:
+            candidate_ids.append(pid)
+            candidate_embs.append(np.frombuffer(e, dtype=np.float32))
+
+    if candidate_ids and candidate_embs:
+        selected_indices = mmr_rerank(np.frombuffer(user["embedding"], dtype=np.float32), candidate_embs, top_n=5)
+        recommended_ids = [candidate_ids[i] for i in selected_indices]
+        recommended_products = get_products_by_ids(recommended_ids)
+    else:
+        recommended_products = []
+
     return render_template(
         "product_detail.html",
-        user=user_profile,
+        user=user,
         product=product,
         similar_products=similar_products,
         recommended_products=recommended_products
