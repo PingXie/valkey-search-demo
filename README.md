@@ -31,15 +31,18 @@ Follow these steps to get the application running.
 We will use the official valkey/valkey-extensions Docker image, which comes with the Vector Search module pre-installed. This command starts a Valkey container, names it valkey-demo, and maps the default port 6379\.
 
 \# We use \--rm to automatically remove the container when it's stopped, keeping things clean.  
+```
 docker run \-d \--rm \--name valkey-demo \-p 6379:6379 valkey/valkey-extensions
-
+```
 **Verify that the container is running:**
-
+```
 docker ps
+```
 
-You should see valkey-demo in the list. To test the connection, run:
-
+You` should see valkey-demo in the list. To test the connection, run:
+```
 docker exec valkey-demo valkey-cli PING
+```
 
 The server should reply with PONG.
 
@@ -48,17 +51,19 @@ The server should reply with PONG.
 It is highly recommended to use a Python virtual environment to manage dependencies.
 
 \# Create a virtual environment named 'venv'  
+```
 python3 \-m venv venv
-
+```
 \# Activate the virtual environment  
 \# On macOS/Linux/Fish Shell:  
+```
 source venv/bin/activate
-
-\# On Windows Command Prompt:  
-\# .\\venv\\Scripts\\activate
+```
 
 \# Now, install all required Python packages from the requirements file  
+```
 pip install \-r requirements.txt
+```
 
 ### **Step 3: Configure Google Cloud and Load Data**
 
@@ -68,15 +73,19 @@ The application requires access to Google Cloud for its AI features.
 
 This command will open a browser window for you to log in. It configures "Application Default Credentials," which our Python libraries use to authenticate automatically.
 
+```
 gcloud auth login
 gcloud auth application-default login
+```
 
 **2\. Set Your Project ID**
 
 Set your GCP Project ID as an environment variable. The scripts will use this to connect to the correct project.
 
 \# In Bash/Zsh  
+```
 export GCP\_PROJECT="your-gcp-project-id"
+```
 
 \# In Fish Shell  
 \# set \-x GCP\_PROJECT "your-gcp-project-id"
@@ -89,15 +98,18 @@ You must run the script below  in order to populate the Valkey database. The scr
 
 \# Load product data from the included CSV and generate embeddings  
 \# Add \--cluster if applicable  
+```
 python3 load\_data.py \--project $GCP\_PROJECT
-
+```
 ### **Step 4: Run the Web Application**
 
 Finally, set the required Flask environment variables and run the application.
 
 \# In Bash/Zsh  
+```
 export FLASK\_APP="app.py"  
 export FLASK\_SECRET\_KEY="a-very-strong-and-random-secret-key-12345"
+```
 
 \# In Fish Shell  
 \# set \-x FLASK\_APP "app.py"  
@@ -105,7 +117,9 @@ export FLASK\_SECRET\_KEY="a-very-strong-and-random-secret-key-12345"
 
 \# Run the Flask development server  
 \# Add the \-- \--cluster flag if connecting to a Valkey Cluster  
+```
 flask run \--host=0.0.0.0 \--port=5001
+```
 
 ## **Accessing the Demo**
 
@@ -134,6 +148,7 @@ You will see the login page for the demo application.
 
 1. **Stop the Flask Server:** Go to the terminal where Flask is running and press CTRL+C.  
 2. **Stop the Valkey Container:**  
-   docker stop valkey-demo
-
+```
+    docker stop valkey-demo
+```
    *(Since we started it with \--rm, it will be automatically removed when stopped).*
