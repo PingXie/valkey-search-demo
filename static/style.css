@@ -8,6 +8,9 @@ body {
 
 main {
     padding: 20px;
+    /* --- ADDED: Add top padding equal to the header's approximate height --- */
+    /* This pushes the main content down so it starts below the fixed header */
+    padding-top: 80px;
 }
 
 .container {
@@ -28,6 +31,14 @@ hr {
 
 /* Header & Navigation */
 header {
+    /* --- ADDED These properties to make the header fixed --- */
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1000; /* High z-index to keep it on top of other content */
+    
+    /* --- Existing styles --- */
     background-color: #ffffff;
     padding: 10px 40px;
     display: flex;
@@ -36,7 +47,6 @@ header {
     border-bottom: 1px solid #dfe1e6;
     box-shadow: 0 1px 3px rgba(0,0,0,0.1);
 }
-
 .logo a {
     font-size: 1.5em;
     font-weight: bold;
