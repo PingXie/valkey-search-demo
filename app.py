@@ -156,43 +156,45 @@ def get_products_by_ids(ids):
 
 # --- Async LLM Descriptions ---
 def get_personalized_descriptions_async(user_profile, products):
+    """
+    Kicks off a SINGLE background thread that loops through products sequentially
+    to generate and cache their descriptions.
+    """
     def task():
         if not gemini_client:
             print("INFO: Gemini client not available, skipping description generation.")
             return
 
+        # This loop now runs sequentially within the single background thread
         for product in products:
             cache_key = f"llm_cache:user:{user_profile['id']}:product:{product['id']}"
             if valkey_client.exists(cache_key):
-                print(f"INFO: Cache hit for {cache_key}")
+                print(f"INFO: [Sequential] Cache hit for {cache_key}")
                 continue
 
-            print(f"INFO: Cache miss for {cache_key}. Attempting to call Gemini...")
+            print(f"INFO: [Sequential] Cache miss for {cache_key}. Calling Gemini...")
             prompt = (
-                f"You are a helpful and persuasive sales assistant. "
-                f"A user named {user_profile['name']} is looking at '{product['name']}'. "
-                f"Their bio is: '{user_profile['bio']}'. "
-                f"Write a short, exciting, personalized paragraph addressing their interests. No markdown."
+                f"You are a helpful and persuasive sales assistant. A user named {user_profile['name']} "
+                f"is considering the product: '{product['name']}'. Their bio is: '{user_profile['bio']}'. "
+                f"Write a short, personalized paragraph for this product that addresses their interests. No markdown."
             )
             try:
-                model_name = app.config['GEMINI_MODEL_NAME']
                 response = gemini_client.models.generate_content(
-                    model=model_name,
+                    model=app.config['GEMINI_MODEL_NAME'],
                     contents=[prompt]
                 )
                 desc = response.text if response and response.text else None
-                if not desc:
-                    raise ValueError("Received an empty response from Gemini.")
-                print(f"INFO: Successfully received response from Gemini for {cache_key}")
+                if not desc: raise ValueError("Received empty response from Gemini")
+                print(f"INFO: [Sequential] Gemini call SUCCESS for {cache_key}")
             except Exception as e:
-                print(f"WARNING: Gemini API call failed, using mock response. Details: {e}")
+                print(f"WARNING: [Sequential] Gemini API call failed, using mock response. Details: {e}")
                 desc = (
-                    f"For a savvy individual like {user_profile['name']}, the {product['name']} "
-                    f"stands out with its robust features that align perfectly with your unique interests and needs."
+                    f"For an individual like {user_profile['name']}, the {product['name']} "
+                    f"is a standout choice, aligning perfectly with your unique interests and needs."
                 )
-            valkey_client.set(cache_key, desc, ex=7200) # Cache for 2 hours
-            print(f"INFO: Cached description for {cache_key}")
+            valkey_client.set(cache_key, desc, ex=7200)
 
+    # Start the single background thread to run the task
     threading.Thread(target=task).start()
 
 # --- Routes ---
@@ -342,6 +344,7 @@ def product_detail(product_id):
         res_sim = ft.search(q_prod, {"product_vec": product_emb_bytes})
         sim_ids = [f"{d.id}" for d in res_sim.docs if d.id != product_id][:5]
         similar_products = get_products_by_ids(sim_ids)
+        get_personalized_descriptions_async(user, similar_products)
 
     q_user = Query("*=>[KNN 25 @embedding $user_vec]").return_field("id").dialect(2)
     res_user = ft.search(q_user, {"user_vec": user["embedding"]})
@@ -361,6 +364,7 @@ def product_detail(product_id):
         selected_indices = mmr_rerank(np.frombuffer(user["embedding"], dtype=np.float32), candidate_embs, top_n=5)
         recommended_ids = [candidate_ids[i] for i in selected_indices]
         recommended_products = get_products_by_ids(recommended_ids)
+        get_personalized_descriptions_async(user, recommended_products)
     else:
         recommended_products = []
 
