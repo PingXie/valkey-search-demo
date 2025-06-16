@@ -11,6 +11,7 @@ import pandas as pd
 from tqdm import tqdm
 import random
 import numpy as np
+from kaggle.api.kaggle_api_extended import KaggleApi
 
 # Valkey imports for both modes
 import valkey
@@ -42,6 +43,7 @@ IS_CLUSTER = args.cluster
 GCP_PROJECT = args.project
 GCP_LOCATION = args.location
 FLUSH_DATA = args.flush
+NUM_PERSONAS_TO_LOAD = 10
 DATA_DIR = "data"
 BATCH_SIZE = 100  # Keep batch size small to stay under API token limits
 MODEL_NAME = "text-embedding-004"
@@ -73,20 +75,40 @@ def clean_numeric(val, to_type=float):
         return to_type(numeric_part[0]) if numeric_part else 0
     except (ValueError, IndexError): return 0
 
+def generate_avatar_data_uri(user_id: str) -> str:
+    m = hashlib.md5()
+    m.update(user_id.encode('utf-8'))
+    digest = m.digest()
+    hue = int(digest[0]) * 360 // 256
+    fg_color = f"hsl({hue}, 55%, 50%)"
+    bg_color = "hsl(0, 0%, 94%)"
+    svg = f'<svg viewBox="0 0 80 80" width="80" height="80" xmlns="http://www.w3.org/2000/svg"><rect width="80" height="80" fill="{bg_color}" />'
+    for y in range(5):
+        for x in range(3):
+            bit_index = (y * 3 + x) % (len(digest) * 8)
+            byte_index, inner_bit_index = divmod(bit_index, 8)
+            if (digest[byte_index] >> inner_bit_index) & 1:
+                svg += f'<rect x="{x*16}" y="{y*16}" width="16" height="16" fill="{fg_color}" />'
+                if x < 2:
+                    svg += f'<rect x="{(4-x)*16}" y="{y*16}" width="16" height="16" fill="{fg_color}" />'
+    svg += '</svg>'
+    b64_svg = base64.b64encode(svg.encode('utf-8')).decode('utf-8')
+    return f"data:image/svg+xml;base64,{b64_svg}"
+
 # --- 1. Initialize Clients (Valkey and Vertex AI) ---
-print("--- Unified Data and Embedding Loader ---")
+print("========== Unified Data and Embedding Loader ==========")
 try:
-    print(f"Initializing Vertex AI for project '{GCP_PROJECT}' in '{GCP_LOCATION}'...")
+    print(f"\n--- Initializing Vertex AI for project '{GCP_PROJECT}' in '{GCP_LOCATION}'...")
     vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
     model = TextEmbeddingModel.from_pretrained(MODEL_NAME)
-    print(f"Vertex AI model '{MODEL_NAME}' loaded. Vector dimension: {VECTOR_DIM}")
+    print(f"✅ Vertex AI model '{MODEL_NAME}' loaded. Vector dimension: {VECTOR_DIM}")
 
     # --- MODIFIED: Conditional client initialization ---
     if IS_CLUSTER:
         mode_message = "Cluster"
-        print(f"Connecting to Valkey Cluster at entrypoint {VALKEY_HOST}:{VALKEY_PORT}...")
+        print(f"\n--- Connecting to Valkey Cluster at entrypoint {VALKEY_HOST}:{VALKEY_PORT}...")
         startup_nodes = [ClusterNode(host=VALKEY_HOST, port=VALKEY_PORT)]
-        print("\n--- Discovering primary nodes... ---")
+        print("Discovering primary nodes...")
         r = ValkeyCluster(startup_nodes=startup_nodes, decode_responses=True)
         primary_node_objects = r.get_primaries()
         primary_nodes = [{'host': node.host, 'port': node.port} for node in primary_node_objects]
@@ -99,12 +121,12 @@ try:
 
     else:
         mode_message = "Standalone"
-        print(f"Connecting to standalone Valkey server at {VALKEY_HOST}:{VALKEY_PORT}...")
+        print(f"\n--- Connecting to standalone Valkey server at {VALKEY_HOST}:{VALKEY_PORT}...")
         r = valkey.Valkey(host=VALKEY_HOST, port=VALKEY_PORT)
         primary_nodes = [{"host": VALKEY_HOST, "port": VALKEY_PORT}]
 
     r.ping()
-    print(f"Successfully connected to Valkey ({mode_message} mode).")
+    print(f"✅ Successfully connected to Valkey ({mode_message} mode).")
 
 except Exception as e:
     print(f"Error during initialization: {e}")
@@ -113,6 +135,7 @@ except Exception as e:
 
 # --- 2. Prepare Nodes for Flushing ---
 if FLUSH_DATA:
+    print("\n--- Flushing server(s) ...")
     print(f"⚠️  WARNING: This will delete ALL data from the Valkey server! ⚠️")
     print(f"⚠️  WARNING: This operation is irreversible! ⚠️")
 
@@ -122,7 +145,6 @@ if FLUSH_DATA:
         exit(0)
 
     # -------- Universal Execution Logic --------
-    print("\n--- Flushing server(s)... ---")
     success_count = 0
     error_count = 0
 
@@ -143,22 +165,54 @@ if FLUSH_DATA:
     print(f"Summary: {success_count} node(s) flushed, {error_count} failed.")
 
 # --- 3. Find, Load, and Prepare Data ---
-print("\n--- Finding and Preparing Data ---")
-csv_path = None
+print("\n--- Finding and Preparing Product Data ---")
+# Define the exact header you require, as a list of strings
+REQUIRED_PRODUCT_HEADER = [
+    "name", "main_category", "sub_category", "image", "link",
+    "ratings", "no_of_ratings", "discount_price", "actual_price"
+]
+matching_csv_paths = []
+print(f"Searching for all CSV files in '{DATA_DIR}' with a matching header...")
+
+# Recursively search for all CSV files that match the header
 for root, dirs, files in os.walk(DATA_DIR):
     for file in files:
         if file.lower().endswith(".csv"):
-            csv_path = os.path.join(root, file)
-            break
-    if csv_path: break
-if not csv_path:
-    print(f"Error: No CSV file found in the '{DATA_DIR}' directory or its subdirectories.")
+            potential_path = os.path.join(root, file)
+            print(f"Checking file: {potential_path}")
+            try:
+                # Read only the header of the CSV to check columns
+                df_header = pd.read_csv(potential_path, nrows=0)
+                print(f"Found header: {list(df_header.columns)}")
+
+                # Compare the file's columns with your required header
+                if list(df_header.columns) == REQUIRED_PRODUCT_HEADER:
+                    print(f"Header match found. Adding file to list: {potential_path}")
+                    matching_csv_paths.append(potential_path)
+
+            except Exception as e:
+                print(f"Could not read header of {potential_path}. Skipping. Error: {e}")
+
+# --- MODIFIED: Check if any matching files were found ---
+if not matching_csv_paths:
+    print(f"Error: No CSV files with the required header were found in '{DATA_DIR}' or its subdirectories.")
     exit(1)
 
-print(f"Found and loading data from: {csv_path}")
-df = pd.read_csv(csv_path, index_col=0, on_bad_lines='skip')
-df.dropna(subset=['name'], inplace=True)
-df = df.fillna('')
+print(f"\nLoading and combining data from {len(matching_csv_paths)} file(s)...")
+try:
+    # Create a list of DataFrames by reading each valid CSV
+    list_of_dfs = [
+        pd.read_csv(path, index_col=0, on_bad_lines='skip')
+        for path in matching_csv_paths
+    ]
+
+    # Concatenate all DataFrames in the list into a single master DataFrame
+    df = pd.concat(list_of_dfs, ignore_index=True)
+
+except Exception as e:
+    print(f"Error loading or concatenating CSV files. Details: {e}")
+    exit(1)
+
 print(f"✅ Data prepared. Processing all {len(df)} records.")
 
 # --- 4. Process Data in Batches (Generate Embeddings and Load to Valkey) ---
@@ -176,7 +230,7 @@ for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing Batches"):
 
     # This pipeline logic works for both standalone and cluster clients
     pipe = r.pipeline(transaction=False)
-    for (index, row), embedding_vector in zip(batch_df.iterrows(), embedding_vectors):
+    for (index, row), embedding_vectors in zip(batch_df.iterrows(), embedding_vectors):
         product_key = f"product:{index}"
         brand = extract_brand(row['name'])
         region = random.choice(REGIONS)
@@ -192,16 +246,16 @@ for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing Batches"):
             'original_price': clean_numeric(row.get('actual_price')),
             'brand_tags': generate_tags(brand), 'search_tags': generate_tags(combined_text_for_tags),
             'region': region,
-            'embedding': np.array(embedding_vector, dtype=np.float32).tobytes()
+            'embedding': np.array(embedding_vectors, dtype=np.float32).tobytes()
         }
         pipe.hset(product_key, mapping=product_data)
 
     pipe.execute()
 
-print("✅ Data loading and embedding generation process finished successfully. ---")
+print("✅ Data loading and embedding generation process finished successfully.")
 
 # --- 5. Final Instruction: Create the Full Index ---
-print(f"\n--- Checking for index '{INDEX_NAME}'... ---")
+print(f"\n--- Preparing index '{INDEX_NAME}'... ---")
 try:
     # This works on both client types
     r.ft(INDEX_NAME).info()
@@ -240,101 +294,65 @@ except Exception:
         exit(1)
 
 # --- 6. Create Users ---
-# --- NEW: Avatar Generation Function ---
-def generate_avatar_data_uri(user_id: str) -> str:
-    """
-    Generates a unique, deterministic 5x5 SVG identicon and returns it as a Data URI.
-    """
-    # Use MD5 hash to get a consistent set of bytes for a user_id
-    m = hashlib.md5()
-    m.update(user_id.encode('utf-8'))
-    digest = m.digest()
+print("\n--- Loading Persona Dataset ---")
+print("Downloading Persona Dataset from Kaggle ...")
+try:
+    api = KaggleApi()
+    api.authenticate()
+    # This is the "Persona-Driven Conversations Dataset"
+    api.dataset_download_files('sabikasabika/new-conversations', path='./data', unzip=True)
+    csv_path = './data/New-Persona-New-Conversations.csv'
+    df = pd.read_csv(csv_path)
+    # The persona description is in the 'persona' column
+    # We drop duplicates to get unique personas
+    unique_personas = df['persona'].drop_duplicates()
+    
+    # Select 10 random personas
+    if len(unique_personas) > NUM_PERSONAS_TO_LOAD:
+        sampled_personas = unique_personas.sample(n=NUM_PERSONAS_TO_LOAD, random_state=42)
+    else:
+        sampled_personas = unique_personas
+    print(f"✅ Successfully downloaded and sampled {len(sampled_personas)} personas.")
+except Exception as e:
+    print(f"❌ FATAL: Could not download or process Kaggle dataset. Check API credentials. Error: {e}")
+    exit(1)
 
-    # Generate a unique color from the hash
-    hue = int(digest[0]) * 360 // 256
-    fg_color = f"hsl({hue}, 55%, 50%)"
-    bg_color = "hsl(0, 0%, 94%)" # Light grey background
+print(f"Generating embeddings and storing {len(sampled_personas)} personas ...")
+user_id_counter = 201
+pipe = r.pipeline(transaction=False)
 
-    # Start the SVG string
-    svg = f'<svg viewBox="0 0 80 80" width="80" height="80" xmlns="http://www.w3.org/2000/svg"><rect width="80" height="80" fill="{bg_color}" />'
+for persona_text in tqdm(sampled_personas, desc="Processing Personas"):
+    user_id = f"user:{user_id_counter}"
+    
+    # Create a descriptive text for embedding
+    # We use the full persona description as it's rich with interests
+    text_to_embed = []
+    text_to_embed.append(f"User persona: {persona_text}")
 
-    # Create a 5x5 pattern, taking advantage of symmetry
-    for y in range(5):
-        for x in range(3): # Only need to compute the first 3 columns
-            # Use bits from the hash to decide if a square is drawn
-            # The bit position is chosen to create varied patterns
-            bit_index = (y * 3 + x) % (len(digest) * 8)
-            byte_index = bit_index // 8
-            inner_bit_index = bit_index % 8
+    # Generate embedding using the known-good model
+    response = model.get_embeddings(text_to_embed)
+    embedding_vectors = [item.values for item in response]
 
-            if (digest[byte_index] >> inner_bit_index) & 1:
-                # Draw the square and its horizontal mirror
-                svg += f'<rect x="{x*16}" y="{y*16}" width="16" height="16" fill="{fg_color}" />'
-                if x < 2: # Don't mirror the center column
-                    svg += f'<rect x="{(4-x)*16}" y="{y*16}" width="16" height="16" fill="{fg_color}" />'
+    # Generate an avatar
+    avatar_uri = generate_avatar_data_uri(user_id)
 
-    svg += '</svg>'
-
-    # Encode the SVG to Base64 and create the Data URI
-    b64_svg = base64.b64encode(svg.encode('utf-8')).decode('utf-8')
-    return f"data:image/svg+xml;base64,{b64_svg}"
-
-
-# --- Persona Definitions ---
-personas = [
-    {
-        "id": "user:101",
-        "name": "Alex Chen",
-        "gender": "Non-binary",
-        "location": "Seattle, WA",
-        "bio": "A 28-year-old software developer and avid PC gamer...",
-        "purchase_history": [
-            {"product_id": "product:2502", "timestamp": (datetime.now() - timedelta(days=15)).isoformat()},
-            {"product_id": "product:4439", "timestamp": (datetime.now() - timedelta(days=40)).isoformat()},
-            {"product_id": "product:9583", "timestamp": (datetime.now() - timedelta(days=90)).isoformat()},
-        ],
-        "interests_for_embedding": "PC gaming, high-performance graphics cards, mechanical keyboards..."
-    },
-    {
-        "id": "user:102",
-        "name": "Brenda Garcia",
-        "gender": "Female",
-        "location": "Denver, CO",
-        "bio": "A 34-year-old landscape photographer and weekend hiker...",
-        "purchase_history": [
-            {"product_id": "product:9146", "timestamp": (datetime.now() - timedelta(days=22)).isoformat()},
-            {"product_id": "product:301", "timestamp": (datetime.now() - timedelta(days=60)).isoformat()},
-            {"product_id": "product:3611", "timestamp": (datetime.now() - timedelta(days=120)).isoformat()},
-        ],
-        "interests_for_embedding": "Outdoor photography, hiking, durable tech, portable power banks..."
-    }
-]
-
-# --- 7. Load Personas into Valkey ---
-print(f"\n--- Generating avatars, embeddings, and storing {len(personas)} personas ---")
-for persona in personas:
-    # --- Generate all assets for the persona ---
-    print(f"Processing data for {persona['name']} ({persona['id']})...")
-
-    # 1. Generate the Avatar Data URI
-    avatar_uri = generate_avatar_data_uri(persona['id'])
-
-    # 2. Generate the embedding
-    embedding_text = f"User Bio: {persona['bio']} User Interests: {persona['interests_for_embedding']}"
-    response = model.get_embeddings([embedding_text])
-    embedding_vector = response[0].values
-
-    # 3. Prepare the complete data for the Valkey Hash
+    # Prepare data for Valkey Hash
     persona_data = {
-        "name": persona["name"],
-        "gender": persona["gender"],
-        "location": persona["location"],
-        "bio": persona["bio"],
-        "purchase_history": json.dumps(persona["purchase_history"]),
-        "embedding": np.array(embedding_vector, dtype=np.float32).tobytes(),
-        "avatar": avatar_uri  # ADDED: The new avatar data URI field
+        "id": user_id,
+        "name": f"Kaggle Persona {user_id_counter}",
+        "bio": persona_text,
+        "avatar": avatar_uri,
+        "embedding": np.array(embedding_vectors[0], dtype=np.float32).tobytes()
     }
+    
+    # Add the HSET command to the pipeline
+    pipe.hset(user_id, mapping=persona_data)
+    user_id_counter += 1
 
-    # 4. Store the complete persona profile in a Valkey Hash
-    r.hset(persona['id'], mapping=persona_data)
-    print(f"✅ Successfully stored persona {persona['id']} in Valkey.")
+# Execute the pipeline to save all personas
+try:
+    print("Saving personas to Valkey ...")
+    pipe.execute()
+    print(f"✅ Successfully stored {user_id_counter - 201} personas in Valkey.")
+except Exception as e:
+    print(f"❌ Failed to save personas to Valkey. Error: {e}")
