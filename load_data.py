@@ -11,7 +11,6 @@ import pandas as pd
 from tqdm import tqdm
 import random
 import numpy as np
-from kaggle.api.kaggle_api_extended import KaggleApi
 
 # Valkey imports for both modes
 import valkey
@@ -173,7 +172,7 @@ REQUIRED_PRODUCT_HEADER = [
     "ratings", "no_of_ratings", "discount_price", "actual_price"
 ]
 matching_csv_paths = []
-print(f"Searching for all CSV files in '{DATA_DIR}' with a matching header...")
+print(f"Searching for all product data files in '{DATA_DIR}' ...")
 
 # Recursively search for all CSV files that match the header
 for root, dirs, files in os.walk(DATA_DIR):
@@ -190,14 +189,14 @@ for root, dirs, files in os.walk(DATA_DIR):
                     matching_csv_paths.append(potential_path)
 
             except Exception as e:
-                print(f"Could not read header of {potential_path}. Skipping. Error: {e}")
+                print(f"❌ Could not read header of {potential_path}. Skipping. Error: {e}")
 
 # --- MODIFIED: Check if any matching files were found ---
 if not matching_csv_paths:
-    print(f"Error: No CSV files with the required header were found in '{DATA_DIR}' or its subdirectories.")
+    print(f"❌ Error: No CSV files with the required header were found in '{DATA_DIR}' or its subdirectories.")
     exit(1)
 
-print(f"\nLoading and combining data from {len(matching_csv_paths)} file(s)...")
+print(f"Loading and combining data from {len(matching_csv_paths)} file(s)...")
 try:
     # Create a list of DataFrames by reading each valid CSV
     list_of_dfs = [
@@ -209,13 +208,13 @@ try:
     df = pd.concat(list_of_dfs, ignore_index=True)
 
 except Exception as e:
-    print(f"Error loading or concatenating CSV files. Details: {e}")
+    print(f"❌ Error loading or concatenating CSV files. Details: {e}")
     exit(1)
 
 print(f"✅ Data prepared. Processing all {len(df)} records.")
 
 # --- 4. Process Data in Batches (Generate Embeddings and Load to Valkey) ---
-print("\n--- Generating Embeddings and Loading to Valkey in Batches ---")
+print("\n--- Generating Product Embeddings and Loading to Valkey in Batches ---")
 for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing Batches"):
     batch_df = df.iloc[i:i+BATCH_SIZE]
 
@@ -294,64 +293,43 @@ except Exception:
 
 # --- 6. Create Users ---
 print("\n--- Loading Persona Dataset ---")
-print("Downloading Persona Dataset from Kaggle ...")
+PERSONAS_CSV_PATH = "data/personas.csv"
 try:
-    api = KaggleApi()
-    api.authenticate()
-    # This is the "Persona-Driven Conversations Dataset"
-    api.dataset_download_files('sabikasabika/new-conversations', path='./data', unzip=True)
-    csv_path = './data/New-Persona-New-Conversations.csv'
-    df = pd.read_csv(csv_path)
-    # The persona description is in the 'persona' column
-    # We drop duplicates to get unique personas
-    unique_personas = df['persona'].drop_duplicates()
-    
-    # Select 10 random personas
-    if len(unique_personas) > NUM_PERSONAS_TO_LOAD:
-        sampled_personas = unique_personas.sample(n=NUM_PERSONAS_TO_LOAD, random_state=42)
-    else:
-        sampled_personas = unique_personas
-    print(f"✅ Successfully downloaded and sampled {len(sampled_personas)} personas.")
-except Exception as e:
-    print(f"❌ FATAL: Could not download or process Kaggle dataset. Check API credentials. Error: {e}")
+    df = pd.read_csv(PERSONAS_CSV_PATH)
+    print(f"✅ Successfully loaded {len(df)} personas from CSV.")
+except FileNotFoundError:
+    print(f"❌ FATAL: The persona database file '{PERSONAS_CSV_PATH}' was not found.")
     exit(1)
 
-print(f"Generating embeddings and storing {len(sampled_personas)} personas ...")
-user_id_counter = 201
+# --- 3. Process and Store Each Persona ---
+print(f"\n--- Generating Persona Embeddings and Storing {len(df)} in Valkey  ---")
 pipe = r.pipeline(transaction=False)
+for index, persona in tqdm(df.iterrows(), total=df.shape[0], desc="Processing Personas"):
+    user_id = persona['id']
+    texts_to_embed = []
+    texts_to_embed.append( f"User Persona: {persona['bio']} User Interests: {persona['interests_for_embedding']}")
 
-for persona_text in tqdm(sampled_personas, desc="Processing Personas"):
-    user_id = f"user:{user_id_counter}"
-    
-    # Create a descriptive text for embedding
-    # We use the full persona description as it's rich with interests
-    text_to_embed = []
-    text_to_embed.append(f"User persona: {persona_text}")
+    try:
+        response = model.get_embeddings(texts_to_embed)
+        embedding_vector = [item.values for item in response][0]
+    except Exception as e:
+        print(f"WARNING: Could not generate embedding for {user_id}. Using random vector. Details: {e}")
+        embedding_vector = np.random.rand(768).astype(np.float32)
 
-    # Generate embedding using the known-good model
-    response = model.get_embeddings(text_to_embed)
-    embedding_vectors = [item.values for item in response]
-
-    # Generate an avatar
-    avatar_uri = generate_avatar_data_uri(user_id)
-
-    # Prepare data for Valkey Hash
+    # Prepare data for Valkey Hash. The purchase_history is already a JSON string from the CSV.
     persona_data = {
         "id": user_id,
-        "name": f"Kaggle Persona {user_id_counter}",
-        "bio": persona_text,
-        "avatar": avatar_uri,
-        "embedding": np.array(embedding_vectors[0], dtype=np.float32).tobytes()
+        "name": persona.get("name", f"User {user_id}"),
+        "bio": persona.get("bio", ""),
+        "purchase_history": persona.get("purchase_history", "[]"),
+        "embedding": np.array(embedding_vector, dtype=np.float32).tobytes(),
+        "avatar": generate_avatar_data_uri(user_id)
     }
-    
-    # Add the HSET command to the pipeline
     pipe.hset(user_id, mapping=persona_data)
-    user_id_counter += 1
 
-# Execute the pipeline to save all personas
 try:
     print("Saving personas to Valkey ...")
     pipe.execute()
-    print(f"✅ Successfully stored {user_id_counter - 201} personas in Valkey.")
+    print("✅ Successfully stored personas in Valkey.")
 except Exception as e:
     print(f"❌ Failed to save personas to Valkey. Error: {e}")
