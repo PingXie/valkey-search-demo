@@ -252,3 +252,9 @@ header {
     border-radius: 4px;
     margin-bottom: 15px;
 }
+
+/* Add to the bottom of style.css */
+.personalized-pitch.loading p {
+    font-style: italic;
+    color: #6b778c;
+}

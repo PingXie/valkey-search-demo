@@ -6,6 +6,7 @@ import random
 import numpy as np
 import argparse
 import json
+import time
 
 # Valkey imports
 import valkey
@@ -13,7 +14,7 @@ from valkey.cluster import ValkeyCluster, ClusterNode
 from valkey.commands.search.query import Query
 
 # Flask imports
-from flask import Flask, render_template, request, redirect, url_for, session
+from flask import Flask, render_template, request, redirect, url_for, session, Response, stream_with_context
 
 from google import genai
 from google.genai import types
@@ -286,6 +287,32 @@ def search():
         get_personalized_descriptions_async(user, products)
     return render_template("home.html", user=user, products=products, search_query=query_text)
 
+@app.route("/stream/<cache_key>")
+def stream(cache_key):
+    """
+    This endpoint checks the Valkey cache repeatedly and streams the result
+    as soon as it's available.
+    """
+    def generate():
+        # Try to get the cached result for up to 20 seconds
+        retries = 20
+        while retries > 0:
+            description = valkey_client.get(cache_key)
+            if description:
+                # If found, send the data and close the connection
+                yield f"data: {json.dumps({'description': description.decode('utf-8')})}\n\n"
+                return
+
+            # Wait for 1 second before checking again
+            time.sleep(1)
+            retries -= 1
+
+        # If the key never appears, send a timeout message
+        yield f"data: {json.dumps({'description': 'Could not generate a personalized description at this time.'})}\n\n"
+
+    # Return a streaming response with the correct mimetype
+    return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
 @app.route("/product/<product_id>")
 def product_detail(product_id):
     uid = session.get("user_id")
@@ -300,6 +327,10 @@ def product_detail(product_id):
 
     cache_key = f"llm_cache:user:{uid}:product:{product_id}"
     desc = valkey_client.get(cache_key)
+    # Check if the description is already in the cache. If not, start the async job.
+    if not valkey_client.exists(cache_key):
+        get_personalized_descriptions_async(user, [product])
+
     product['personalized_description'] = desc.decode() if desc else "A great choice that combines quality and value."
 
     ft = valkey_client.ft("products")
@@ -337,6 +368,7 @@ def product_detail(product_id):
         "product_detail.html",
         user=user,
         product=product,
+        llm_cache_key=cache_key,
         similar_products=similar_products,
         recommended_products=recommended_products
     )

@@ -10,15 +10,15 @@
             <h1>{{ product.name }}</h1>
             <p class="product-price">₹ {{ "%.2f"|format(product.price|float) }}</p>
             
-            <div class="personalized-pitch">
+            <div id="personalized-pitch-container" class="personalized-pitch loading">
                 <h3>A Great Choice For You!</h3>
-                <p>{{ product.personalized_description }}</p>
+                <p id="personalized-pitch-text">✨ Generating personalized description...</p>
             </div>
 
             <a href="{{ product.link }}" target="_blank" class="buy-button">View on Amazon</a>
         </div>
     </div>
-
+    
     <div class="recommendations">
         <hr>
         <h3>Similar Products</h3>
@@ -26,15 +26,11 @@
             {% for p in similar_products %}
             <a href="{{ url_for('product_detail', product_id=p.id) }}" class="product-card">
                 <img src="{{ p.thumbnail }}" alt="{{ p.name }}" class="product-thumbnail">
-                <div class="product-info">
-                    <p class="product-brand">{{ p.brand }}</p>
-                    <h3 class="product-name">{{ p.name }}</h3>
-                </div>
+                <div class="product-info"><p class="product-brand">{{ p.brand }}</p><h3 class="product-name">{{ p.name }}</h3></div>
             </a>
             {% endfor %}
         </div>
     </div>
-    
     <div class="recommendations">
         <hr>
         <h3>Recommended For You</h3>
@@ -42,13 +38,41 @@
             {% for p in recommended_products %}
             <a href="{{ url_for('product_detail', product_id=p.id) }}" class="product-card">
                 <img src="{{ p.thumbnail }}" alt="{{ p.name }}" class="product-thumbnail">
-                <div class="product-info">
-                    <p class="product-brand">{{ p.brand }}</p>
-                    <h3 class="product-name">{{ p.name }}</h3>
-                </div>
+                <div class="product-info"><p class="product-brand">{{ p.brand }}</p><h3 class="product-name">{{ p.name }}</h3></div>
             </a>
             {% endfor %}
         </div>
     </div>
 </div>
+
+<script>
+    const cacheKey = "{{ llm_cache_key }}";
+    console.log(`[SSE] Initializing EventSource for cache key: ${cacheKey}`);
+    const eventSource = new EventSource(`/stream/${cacheKey}`);
+
+    eventSource.onopen = function() {
+        console.log("[SSE] Connection to server opened.");
+    };
+
+    eventSource.onmessage = function(event) {
+        console.log("[SSE] Message received from server:", event.data);
+        const data = JSON.parse(event.data);
+        
+        const pitchText = document.getElementById("personalized-pitch-text");
+        const pitchContainer = document.getElementById("personalized-pitch-container");
+        
+        pitchText.textContent = data.description;
+        pitchContainer.classList.remove("loading");
+        
+        console.log("[SSE] Page updated. Closing connection.");
+        eventSource.close();
+    };
+
+    eventSource.onerror = function(err) {
+        console.error("[SSE] EventSource failed:", err);
+        const pitchText = document.getElementById("personalized-pitch-text");
+        pitchText.textContent = "Could not load real-time description.";
+        eventSource.close();
+    };
+</script>
 {% endblock %}
