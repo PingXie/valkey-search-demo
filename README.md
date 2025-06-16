@@ -99,7 +99,7 @@ You must run the script below  in order to populate the Valkey database. The scr
 \# Load product data from the included CSV and generate embeddings  
 \# Add \--cluster if applicable  
 ```
-python3 load_data.py --project $GCP\_PROJECT
+python3 load_data.py --project $GCP_PROJECT
 ```
 ### **Step 4: Run the Web Application**
 
@@ -137,8 +137,9 @@ To securely access the app running on your GCE VM from your laptop's browser, us
 
 1. **Open a *new* local terminal window** (keep the Flask server running in the other one).  
 2. Run the following command, replacing the user and IP with your own:  
-   ssh \-L 8080:localhost:5001 your\_user@your\_vm\_ip
-
+```
+   ssh -L 8080:localhost:5001 your_user@your_vm_ip
+```
 3. Now, open the browser **on your laptop** and go to:  
    * **http://localhost:8080**
 
