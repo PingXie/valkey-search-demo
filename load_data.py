@@ -168,6 +168,7 @@ if FLUSH_DATA:
 print("\n--- Finding and Preparing Product Data ---")
 # Define the exact header you require, as a list of strings
 REQUIRED_PRODUCT_HEADER = [
+    "Unnamed: 0",
     "name", "main_category", "sub_category", "image", "link",
     "ratings", "no_of_ratings", "discount_price", "actual_price"
 ]
@@ -179,15 +180,13 @@ for root, dirs, files in os.walk(DATA_DIR):
     for file in files:
         if file.lower().endswith(".csv"):
             potential_path = os.path.join(root, file)
-            print(f"Checking file: {potential_path}")
             try:
                 # Read only the header of the CSV to check columns
                 df_header = pd.read_csv(potential_path, nrows=0)
-                print(f"Found header: {list(df_header.columns)}")
 
                 # Compare the file's columns with your required header
                 if list(df_header.columns) == REQUIRED_PRODUCT_HEADER:
-                    print(f"Header match found. Adding file to list: {potential_path}")
+                    print(f"Found product data file: {potential_path}")
                     matching_csv_paths.append(potential_path)
 
             except Exception as e:
