@@ -94,7 +94,7 @@ export GCP_PROJECT="your-gcp-project-id"
 
 \# In Fish Shell  
 ```
-# set -x GCP_PROJECT "your-gcp-project-id"
+set -x GCP_PROJECT "your-gcp-project-id"
 ```
 *(Replace your-gcp-project-id with your actual project ID)*
 
