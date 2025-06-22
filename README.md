@@ -55,9 +55,14 @@ It is highly recommended to use a Python virtual environment to manage dependenc
 python3 -m venv venv
 ```
 \# Activate the virtual environment  
-\# On macOS/Linux/Fish Shell:  
+\# In Bash Shell:  
 ```
 source venv/bin/activate
+```
+
+\# In Fish Shell:  
+```
+source venv/bin/activate.fish
 ```
 
 \# Now, install all required Python packages from the requirements file  
@@ -82,14 +87,15 @@ gcloud auth application-default login
 
 Set your GCP Project ID as an environment variable. The scripts will use this to connect to the correct project.
 
-\# In Bash/Zsh  
+\# In Bash Shell
 ```
 export GCP_PROJECT="your-gcp-project-id"
 ```
 
 \# In Fish Shell  
-\# set -x GCP_PROJECT "your-gcp-project-id"
-
+```
+# set -x GCP_PROJECT "your-gcp-project-id"
+```
 *(Replace your-gcp-project-id with your actual project ID)*
 
 **3\. Run the Data Loading Scripts**
@@ -99,21 +105,11 @@ You must run the script below  in order to populate the Valkey database. The scr
 \# Load product data from the included CSV and generate embeddings  
 \# Add \--cluster if applicable  
 ```
-python3 load_data.py --project $GCP_PROJECT
+python3 load_data.py
 ```
 ### **Step 4: Run the Web Application**
 
-Finally, set the required Flask environment variables and run the application.
-
-\# In Bash/Zsh  
-```
-export FLASK_APP="app.py"  
-export FLASK_SECRET_KEY="a-very-strong-and-random-secret-key-12345"
-```
-
-\# In Fish Shell  
-\# set \-x FLASK\_APP "app.py"  
-\# set \-x FLASK\_SECRET\_KEY "a-very-strong-and-random-secret-key-12345"
+Finally, run the application.
 
 \# Run the Flask development server  
 \# Add the \-- \--cluster flag if connecting to a Valkey Cluster  
