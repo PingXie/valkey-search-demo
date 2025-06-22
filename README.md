@@ -31,16 +31,16 @@ Follow these steps to get the application running.
 We will use the official valkey/valkey-bundle Docker image, which comes with the Vector Search module pre-installed. This command starts a Valkey container, names it valkey-demo, and maps the default port 6379\.
 
 \# We use \--rm to automatically remove the container when it's stopped, keeping things clean.  
-```
+```bash
 docker run -d --rm --name valkey-demo -p 6379:6379 valkey/valkey-bundle
 ```
 **Verify that the container is running:**
-```
+```bash
 docker ps
 ```
 
 You should see valkey-demo in the list. To test the connection, run:
-```
+```bash
 docker exec valkey-demo valkey-cli PING
 ```
 
@@ -51,22 +51,16 @@ The server should reply with PONG.
 It is highly recommended to use a Python virtual environment to manage dependencies.
 
 \# Create a virtual environment named 'venv'  
-```
+```bash
 python3 -m venv venv
 ```
 \# Activate the virtual environment  
-\# In Bash Shell:  
-```
+```bash
 source venv/bin/activate
 ```
 
-\# In Fish Shell:  
-```
-source venv/bin/activate.fish
-```
-
 \# Now, install all required Python packages from the requirements file  
-```
+```bash
 pip install -r requirements.txt
 ```
 
@@ -106,7 +100,7 @@ Finally, run the application.
 
 \# Run the Flask development server  
 \# Add the \-- \--cluster flag if connecting to a Valkey Cluster  
-```
+```bash
 flask run --host=0.0.0.0 --port=5001
 ```
 
@@ -126,7 +120,7 @@ To securely access the app running on your GCE VM from your laptop's browser, us
 
 1. **Open a *new* local terminal window** (keep the Flask server running in the other one).  
 2. Run the following command, replacing the user and IP with your own:  
-```
+```bash
    ssh -L 8080:localhost:5001 your_user@your_vm_ip
 ```
 3. Now, open the browser **on your laptop** and go to:  
@@ -138,7 +132,7 @@ You will see the login page for the demo application.
 
 1. **Stop the Flask Server:** Go to the terminal where Flask is running and press CTRL+C.  
 2. **Stop the Valkey Container:**  
-```
+```bash
     docker stop valkey-demo
 ```
    *(Since we started it with \--rm, it will be automatically removed when stopped).*
