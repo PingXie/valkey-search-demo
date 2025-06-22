@@ -2,12 +2,12 @@
 
 ## **Introduction**
 
-This project is a fully-functional web application that demonstrates a modern, AI-powered e-commerce experience. It showcases how **Valkey** and its **Vector Search** module can serve as a high-performance, multi-modal backend for complex applications.
+This project is a fully-functional web application that demonstrates a modern, AI-powered e-commerce experience running entirely on your local machine. It showcases how **Valkey** and its **Vector Search** module can serve as a high-performance, multi-modal backend for complex applications.
 
 The application allows users to log in as different "personas" and receive personalized product recommendations and descriptions based on their interests. These recommendations are generated through a hybrid search that combines traditional keyword filtering with advanced vector similarity search.
 
 **Key features demonstrated:**
-
+* **100% Local AI Stack:** All AI features run locally using Ollama and the sentence-transformers library.
 * **Hybrid Search:** Combining keyword (tag) search with vector similarity search.  
 * **Personalization:** Using user profile embeddings to tailor search results.  
 * **AI-Powered Content:** Leveraging Google's Gemini models to generate personalized sales pitches.  
@@ -28,11 +28,11 @@ Follow these steps to get the application running.
 
 ### **Step 1: Start the Valkey Server**
 
-We will use the official valkey/valkey-extensions Docker image, which comes with the Vector Search module pre-installed. This command starts a Valkey container, names it valkey-demo, and maps the default port 6379\.
+We will use the official valkey/valkey-bundle Docker image, which comes with the Vector Search module pre-installed. This command starts a Valkey container, names it valkey-demo, and maps the default port 6379\.
 
 \# We use \--rm to automatically remove the container when it's stopped, keeping things clean.  
 ```
-docker run -d --rm --name valkey-demo -p 6379:6379 valkey/valkey-extensions
+docker run -d --rm --name valkey-demo -p 6379:6379 valkey/valkey-bundle
 ```
 **Verify that the container is running:**
 ```
@@ -70,44 +70,37 @@ source venv/bin/activate.fish
 pip install -r requirements.txt
 ```
 
-### **Step 3: Configure Google Cloud and Load Data**
+### **Step 3: Install Ollama and Download AI Models**
 
-The application requires access to Google Cloud for its AI features.
+This demo uses Ollama to run a small Large Language Model on your machine.
 
-**1\. Authenticate for Application Services**
+**1\. Install Ollama**
 
-This command will open a browser window for you to log in. It configures "Application Default Credentials," which our Python libraries use to authenticate automatically.
-
-```
-gcloud auth login
-gcloud auth application-default login
-```
-
-**2\. Set Your Project ID**
-
-Set your GCP Project ID as an environment variable. The scripts will use this to connect to the correct project.
-
-\# In Bash Shell
-```
-export GCP_PROJECT="your-gcp-project-id"
+For other operating systems, please follow the [Ollama installation instructions](https://ollama.com/docs/install).
+\# Install Ollama on Linux
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-\# In Fish Shell  
-```
-set -x GCP_PROJECT "your-gcp-project-id"
-```
-*(Replace your-gcp-project-id with your actual project ID)*
+**2\. Download the LLM Model**
 
-**3\. Run the Data Loading Script**
+For this demo, we use tinyllama, a 1.1B parameter model that is very fast on CPUs. Open a terminal and run:
+```bash
+ollama pull tinyllama
+```
 
-You must run the script below  in order to populate the Valkey database. The scripts support connecting to both standalone and cluster Valkey servers using the \--cluster flag.
+### **Step 4: Run the Data Loading Script**
+
+This script generates vector embeddings locally using the `sentence-transformers` library and populates the Valkey instance with the product and user data.
+The script supports connecting to both standalone and cluster Valkey servers usiddng the \--cluster flag.
 
 \# Load product data from the included CSV and generate embeddings  
 \# Add \--cluster if applicable  
-```
+```bash
+# This may take a few minutes as it processes data and generates embeddings
 python3 load_data.py
 ```
-### **Step 4: Run the Web Application**
+### **Step 5: Run the Web Application**
 
 Finally, run the application.
 

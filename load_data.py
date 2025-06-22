@@ -16,21 +16,16 @@ import numpy as np
 import valkey
 from valkey.cluster import ValkeyCluster, ClusterNode
 
-# Google Cloud Vertex AI import
-import vertexai
-from vertexai.language_models import TextEmbeddingModel
-
 # --- Argument Parsing ---
-# Combines arguments for both Valkey and GCP
 parser = argparse.ArgumentParser(
-    description="Load product data, generate embeddings with Vertex AI, and store in a Valkey server.",
+    description="Load product data and generate embeddings, using Vertex AI if configured, otherwise falling back to a local model.",
     formatter_class=argparse.RawTextHelpFormatter
 )
 parser.add_argument('--host', type=str, default=os.getenv("VALKEY_HOST", "localhost"), help="IP address or hostname of the Valkey server or a cluster entrypoint.")
 parser.add_argument('--port', type=int, default=int(os.getenv("VALKEY_PORT", 6379)), help="Port number of the Valkey server or a cluster entrypoint.")
-# ADDED: New flag to control cluster mode
 parser.add_argument('--cluster', action='store_true', help="Enable cluster mode for connecting to a Valkey Cluster.")
-parser.add_argument('--project', type=str, default=os.getenv("GCP_PROJECT"), help="Your Google Cloud Project ID.")
+# GCP Project is now optional. If not provided, the script will use the local fallback.
+parser.add_argument('--project', type=str, default=os.getenv("GCP_PROJECT"), help="[Optional] Your Google Cloud Project ID. If not set, a local model will be used.")
 parser.add_argument('--location', type=str, default="us-central1", help="The GCP region for your Vertex AI job.")
 parser.add_argument('--flush', action='store_true', help="Flush all data from the Valkey server before loading new data.")
 args = parser.parse_args()
@@ -39,19 +34,34 @@ args = parser.parse_args()
 VALKEY_HOST = args.host
 VALKEY_PORT = args.port
 IS_CLUSTER = args.cluster
-GCP_PROJECT = args.project
-GCP_LOCATION = args.location
 FLUSH_DATA = args.flush
-NUM_PERSONAS_TO_LOAD = 10
 DATA_DIR = "data"
-BATCH_SIZE = 100  # Keep batch size small to stay under API token limits
-MODEL_NAME = "text-embedding-004"
+BATCH_SIZE = 100
 INDEX_NAME = "products"
 DOC_PREFIX = f"product:"
-VECTOR_DIM = 768 # text-embedding-004 model has 768 dimensions
 DISTANCE_METRIC = "COSINE"
 REGIONS = ["NA", "EU", "ASIA", "LATAM"]
 STOP_WORDS = set(["a", "about", "all", "an", "and", "any", "are", "as", "at", "be", "but", "by", "for", "from", "how", "i", "in", "is", "it", "of", "on", "or", "s", "t", "that", "the", "this", "to", "was", "what", "when", "where", "who", "will", "with", "storage", "ram", "gb", "mah", "mm", "hz", "with", "cm"])
+
+# --- Dynamic AI Configuration ---
+AI_MODE = None
+MODEL_NAME = None
+VECTOR_DIM = None
+model = None # This will hold either the GCP or local model client
+
+if args.project:
+    import vertexai
+    from vertexai.language_models import TextEmbeddingModel
+    AI_MODE = "GCP"
+    GCP_PROJECT = args.project
+    GCP_LOCATION = args.location
+    MODEL_NAME = "text-embedding-004"
+    VECTOR_DIM = 768 # text-embedding-004 model has 768 dimensions
+else:
+    from sentence_transformers import SentenceTransformer
+    AI_MODE = "LOCAL"
+    MODEL_NAME = "all-MiniLM-L6-v2"
+    VECTOR_DIM = 384 # all-MiniLM-L6-v2 model has 384 dimensions
 
 # --- Helper Functions (no changes) ---
 def generate_tags(text: str, separator: str = ',') -> str:
@@ -94,20 +104,22 @@ def generate_avatar_data_uri(user_id: str) -> str:
     b64_svg = base64.b64encode(svg.encode('utf-8')).decode('utf-8')
     return f"data:image/svg+xml;base64,{b64_svg}"
 
-# --- 1. Initialize Clients (Valkey and Vertex AI) ---
-print("========== Unified Data and Embedding Loader ==========")
+# --- 1. Initialize Clients ---
 try:
-    print(f"\n--- Initializing Vertex AI for project '{GCP_PROJECT}' in '{GCP_LOCATION}'...")
-    vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
-    model = TextEmbeddingModel.from_pretrained(MODEL_NAME)
-    print(f"✅ Vertex AI model '{MODEL_NAME}' loaded. Vector dimension: {VECTOR_DIM}")
+    print(f"\n--- AI Mode Detected: {AI_MODE} ---")
+    if AI_MODE == "GCP":
+        print(f"--- Initializing Vertex AI for project '{GCP_PROJECT}' in '{GCP_LOCATION}'...")
+        vertexai.init(project=GCP_PROJECT, location=GCP_LOCATION)
+        model = TextEmbeddingModel.from_pretrained(MODEL_NAME)
+    elif AI_MODE == "LOCAL":
+        print(f"--- Initializing local embedding model '{MODEL_NAME}'...")
+        model = SentenceTransformer(MODEL_NAME)
+    print(f"✅ AI model '{MODEL_NAME}' loaded. Vector dimension: {VECTOR_DIM}")
 
-    # --- MODIFIED: Conditional client initialization ---
     if IS_CLUSTER:
         mode_message = "Cluster"
         print(f"\n--- Connecting to Valkey Cluster at entrypoint {VALKEY_HOST}:{VALKEY_PORT}...")
         startup_nodes = [ClusterNode(host=VALKEY_HOST, port=VALKEY_PORT)]
-        print("Discovering primary nodes...")
         r = ValkeyCluster(startup_nodes=startup_nodes, decode_responses=True)
         primary_node_objects = r.get_primaries()
         primary_nodes = [{'host': node.host, 'port': node.port} for node in primary_node_objects]
@@ -129,7 +141,10 @@ try:
 
 except Exception as e:
     print(f"Error during initialization: {e}")
-    print("Please check your GCP project, authentication, and Valkey connection details.")
+    if AI_MODE == "GCP":
+        print("Please check your GCP project, authentication, and Valkey connection details.")
+    else:
+        print("Please check your Valkey connection details and ensure AI libraries are installed.")
     exit(1)
 
 # --- 2. Prepare Nodes for Flushing ---
@@ -143,15 +158,12 @@ if FLUSH_DATA:
         print("Operation cancelled by user.")
         exit(0)
 
-    # -------- Universal Execution Logic --------
     success_count = 0
     error_count = 0
-
     for node in primary_nodes:
         node_host = node['host']
         node_port = node['port']
         try:
-            # Create a direct, standard connection to the specific node to flush it
             node_conn = valkey.Valkey(host=node_host, port=node_port)
             node_conn.flushall()
             print(f"✅ Successfully flushed {node_host}:{node_port}")
@@ -159,13 +171,11 @@ if FLUSH_DATA:
         except Exception as e:
             print(f"❌ Failed to flush {node_host}:{node_port}. Error: {e}", file=sys.stderr)
             error_count += 1
-
-    # -------- Final Report --------
     print(f"Summary: {success_count} node(s) flushed, {error_count} failed.")
+
 
 # --- 3. Find, Load, and Prepare Data ---
 print("\n--- Finding and Preparing Product Data ---")
-# Define the exact header you require, as a list of strings
 REQUIRED_PRODUCT_HEADER = [
     "Unnamed: 0",
     "name", "main_category", "sub_category", "image", "link",
@@ -174,44 +184,34 @@ REQUIRED_PRODUCT_HEADER = [
 matching_csv_paths = []
 print(f"Searching for all product data files in '{DATA_DIR}' ...")
 
-# Recursively search for all CSV files that match the header
 for root, dirs, files in os.walk(DATA_DIR):
     for file in files:
         if file.lower().endswith(".csv"):
             potential_path = os.path.join(root, file)
             try:
-                # Read only the header of the CSV to check columns
                 df_header = pd.read_csv(potential_path, nrows=0)
-
-                # Compare the file's columns with your required header
                 if list(df_header.columns) == REQUIRED_PRODUCT_HEADER:
                     print(f"Found product data file: {potential_path}")
                     matching_csv_paths.append(potential_path)
-
             except Exception as e:
                 print(f"❌ Could not read header of {potential_path}. Skipping. Error: {e}")
 
-# --- MODIFIED: Check if any matching files were found ---
 if not matching_csv_paths:
     print(f"❌ Error: No CSV files with the required header were found in '{DATA_DIR}' or its subdirectories.")
     exit(1)
 
 print(f"Loading and combining data from {len(matching_csv_paths)} file(s)...")
 try:
-    # Create a list of DataFrames by reading each valid CSV
     list_of_dfs = [
         pd.read_csv(path, index_col=0, on_bad_lines='skip')
         for path in matching_csv_paths
     ]
-
-    # Concatenate all DataFrames in the list into a single master DataFrame
     df = pd.concat(list_of_dfs, ignore_index=True)
-
 except Exception as e:
     print(f"❌ Error loading or concatenating CSV files. Details: {e}")
     exit(1)
-
 print(f"✅ Data prepared. Processing all {len(df)} records.")
+
 
 # --- 4. Process Data in Batches (Generate Embeddings and Load to Valkey) ---
 print("\n--- Generating Product Embeddings and Loading to Valkey in Batches ---")
@@ -223,12 +223,14 @@ for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing Batches"):
         text = f"Product: {row.get('name', '')}. Brand: {extract_brand(row.get('name', ''))}. Category: {row.get('main_category', '')}, {row.get('sub_category', '')}."
         texts_to_embed.append(text)
 
-    response = model.get_embeddings(texts_to_embed)
-    embedding_vectors = [item.values for item in response]
+    if AI_MODE == "GCP":
+        response = model.get_embeddings(texts_to_embed)
+        embedding_vectors = [item.values for item in response]
+    else: # LOCAL mode
+        embedding_vectors = model.encode(texts_to_embed, convert_to_numpy=True)
 
-    # This pipeline logic works for both standalone and cluster clients
     pipe = r.pipeline(transaction=False)
-    for (index, row), embedding_vectors in zip(batch_df.iterrows(), embedding_vectors):
+    for (index, row), embedding_vector in zip(batch_df.iterrows(), embedding_vectors):
         product_key = f"product:{index}"
         brand = extract_brand(row['name'])
         region = random.choice(REGIONS)
@@ -244,7 +246,7 @@ for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing Batches"):
             'original_price': clean_numeric(row.get('actual_price')),
             'brand_tags': generate_tags(brand), 'search_tags': generate_tags(combined_text_for_tags),
             'region': region,
-            'embedding': np.array(embedding_vectors, dtype=np.float32).tobytes()
+            'embedding': np.array(embedding_vector, dtype=np.float32).tobytes()
         }
         pipe.hset(product_key, mapping=product_data)
 
@@ -252,46 +254,53 @@ for i in tqdm(range(0, len(df), BATCH_SIZE), desc="Processing Batches"):
 
 print("✅ Data loading and embedding generation process finished successfully.")
 
-# --- 5. Final Instruction: Create the Full Index ---
+# --- 5. Final Instruction: Create the Full Index (VECTOR_DIM is dynamic) ---
 print(f"\n--- Preparing index '{INDEX_NAME}'... ---")
+# This version is more precise. It attempts to drop the index and will ONLY
+# ignore the specific error that Valkey returns when the index doesn't exist.
+# Any other error during the drop command will correctly halt the script.
 try:
-    # This works on both client types
-    r.ft(INDEX_NAME).info()
-    print(f"Index '{INDEX_NAME}' already exists. No action taken.")
-except Exception:
-    # Any error (likely ResponseError for a non-existent index) means we should try to create it.
-    print(f"Index '{INDEX_NAME}' does not exist. Creating it now...")
-    try:
-        # Define the command arguments. This is the same for both modes.
-        command_args = [
-            "FT.CREATE", INDEX_NAME,
-            "ON", "HASH",
-            "PREFIX", "1", DOC_PREFIX,
-            "SCHEMA",
-            "brand_tags", "TAG", "SEPARATOR", ",",
-            "search_tags", "TAG", "SEPARATOR", ",",
-            "region", "TAG",
-            "price", "NUMERIC",
-            "rating", "NUMERIC",
-            "review_count", "NUMERIC",
-            "embedding", "VECTOR", "HNSW", "6",
-                "TYPE", "FLOAT32",
-                "DIM", str(VECTOR_DIM),
-                "DISTANCE_METRIC", DISTANCE_METRIC
-        ]
+    print(f"Attempting to drop index '{INDEX_NAME}' to ensure a clean slate...")
+    r.execute_command("FT.DROPINDEX", INDEX_NAME)
+    print(f"✅ Existing index '{INDEX_NAME}' dropped successfully.")
+except Exception as e:
+    # This is the correct way to handle this: check if the error message
+    # indicates the index was not found, which is an expected and safe condition.
+    if "Index with name" in str(e):
+        print(f"Index '{INDEX_NAME}' did not exist, which is fine.")
+    else:
+        # If it's a different error, something is wrong, so we re-raise it.
+        print(f"❌ An unexpected error occurred while trying to drop the index: {e}")
+        raise e
 
-        # Use execute_command. The cluster client will route it to a primary node.
-        # The standard client will send it to the connected server.
-        r.execute_command(*command_args)
+# Now, create the index. This part is guaranteed to run on a clean slate.
+try:
+    print(f"Creating index '{INDEX_NAME}' with vector dimension {VECTOR_DIM}...")
+    command_args = [
+        "FT.CREATE", INDEX_NAME,
+        "ON", "HASH",
+        "PREFIX", "1", DOC_PREFIX,
+        "SCHEMA",
+        "brand_tags", "TAG", "SEPARATOR", ",",
+        "search_tags", "TAG", "SEPARATOR", ",",
+        "region", "TAG",
+        "price", "NUMERIC",
+        "rating", "NUMERIC",
+        "review_count", "NUMERIC",
+        "embedding", "VECTOR", "HNSW", "6",
+            "TYPE", "FLOAT32",
+            "DIM", str(VECTOR_DIM),
+            "DISTANCE_METRIC", DISTANCE_METRIC
+    ]
+    r.execute_command(*command_args)
+    print(f"✅ Index '{INDEX_NAME}' created successfully.")
 
-        print(f"✅ Index '{INDEX_NAME}' created successfully.")
-
-    except Exception as e:
-        print(f"❌ Failed to create index '{INDEX_NAME}'.")
-        print(f"Details: {e}")
-        exit(1)
-
-# --- 6. Create Users ---
+except Exception as e:
+    print(f"❌ Failed to create index '{INDEX_NAME}'.")
+    print(f"Details: {e}")
+    exit(1)
+ 
+ # --- 6. Create Users ---
 print("\n--- Loading Persona Dataset ---")
 PERSONAS_CSV_PATH = "data/personas.csv"
 try:
@@ -301,7 +310,6 @@ except FileNotFoundError:
     print(f"❌ FATAL: The persona database file '{PERSONAS_CSV_PATH}' was not found.")
     exit(1)
 
-# --- 3. Process and Store Each Persona ---
 print(f"\n--- Generating Persona Embeddings and Storing {len(df)} in Valkey  ---")
 pipe = r.pipeline(transaction=False)
 for index, persona in tqdm(df.iterrows(), total=df.shape[0], desc="Processing Personas"):
@@ -310,8 +318,11 @@ for index, persona in tqdm(df.iterrows(), total=df.shape[0], desc="Processing Pe
     texts_to_embed.append( f"User Persona: {persona['bio']} User Interests: {persona['interests_for_embedding']}")
 
     try:
-        response = model.get_embeddings(texts_to_embed)
-        embedding_vector = [item.values for item in response][0]
+        if AI_MODE == "GCP":
+            response = model.get_embeddings(texts_to_embed)
+            embedding_vectors = [item.values for item in response]
+        else: # LOCAL mode
+            embedding_vectors = model.encode(texts_to_embed, convert_to_numpy=True)
     except Exception as e:
         print(f"WARNING: Could not generate embedding for {user_id}. Using random vector. Details: {e}")
         embedding_vector = np.random.rand(768).astype(np.float32)

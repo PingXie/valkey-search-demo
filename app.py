@@ -16,13 +16,10 @@ from valkey.commands.search.query import Query
 # Flask imports
 from flask import Flask, render_template, request, redirect, url_for, session, Response, stream_with_context
 
-from google import genai
-from google.genai import types
-
 # --- App Initialization & Argument Parsing ---
 app = Flask(__name__)
 # Use parse_known_args to ensure Flask's own arguments don't cause an error
-parser = argparse.ArgumentParser(description="Valkey VSS Demo with Flask and Gemini.")
+parser = argparse.ArgumentParser(description="Valkey VSS Demo with Flask and a configurable AI backend.")
 parser.add_argument('--cluster', action='store_true', help="Enable cluster mode for connecting to a Valkey Cluster.")
 cli_args, _ = parser.parse_known_args()
 
@@ -34,11 +31,45 @@ app.config['VALKEY_PORT'] = int(os.getenv("VALKEY_PORT", 6379))
 app.config['VALKEY_IS_CLUSTER'] = cli_args.cluster
 app.config['GCP_PROJECT'] = os.getenv("GCP_PROJECT")
 app.config['GCP_LOCATION'] = "us-central1"
-app.config['GEMINI_MODEL_NAME'] = "gemini-2.5-flash-preview-05-20"
-app.config['VECTOR_DIM'] = 768
 app.config['PLACEHOLDER_IMAGE_URL']="https://via.placeholder.com/300.png?text=No+Image"
 
-# --- Client Initialization ---
+# --- Dynamic AI Configuration ---
+ai_client = None
+if app.config.get('GCP_PROJECT'):
+    from google import genai
+    from google.genai import types
+    app.config['AI_MODE'] = "GCP"
+    app.config['LLM_MODEL_NAME'] = "gemini-1.5-flash-preview-0514"
+    app.config['VECTOR_DIM'] = 768
+    print(f"--- AI Mode Detected: {app.config['AI_MODE']} ---")
+    try:
+        print(f"Initializing google.genai client for project '{app.config['GCP_PROJECT']}'...")
+        ai_client = genai.Client(
+            project=app.config['GCP_PROJECT'],
+            location=app.config['GCP_LOCATION']
+        )
+        print("✅ Google Genai client initialized.")
+    except Exception as e:
+        print(f"WARNING: Could not initialize Vertex AI client. AI features will be mocked. Details: {e}")
+        ai_client = None
+
+else:
+    import ollama
+    app.config['AI_MODE'] = "LOCAL"
+    app.config['LLM_MODEL_NAME'] = "tinyllama"
+    app.config['VECTOR_DIM'] = 384
+    print(f"--- AI Mode Detected: {app.config['AI_MODE']} ---")
+    try:
+        print(f"Checking for local Ollama service with model '{app.config['LLM_MODEL_NAME']}'...")
+        # The ollama library doesn't need a persistent client, but we can check for connectivity.
+        ollama.list()
+        ai_client = "Ollama Active" # Use a placeholder string to indicate Ollama is ready
+        print("✅ Ollama service detected.")
+    except Exception as e:
+        print(f"WARNING: Could not connect to Ollama service. AI features will be mocked. Details: {e}")
+        ai_client = None
+
+# --- Valkey Client Initialization ---
 def get_valkey_connection():
     is_cluster = app.config['VALKEY_IS_CLUSTER']
     host = app.config['VALKEY_HOST']
@@ -56,27 +87,10 @@ def get_valkey_connection():
         print(f"FATAL: Could not connect to Valkey. Please check the server. Error: {e}")
         return None
 
-def get_gemini_client():
-    """Initializes and returns the new google.genai client."""
-    try:
-        if not app.config['GCP_PROJECT']:
-            print("WARNING: GCP_PROJECT not set. Gemini features will be mocked.")
-            return None
-        print(f"Initializing google.genai client for project '{app.config['GCP_PROJECT']}'...")
-        return genai.Client(
-            vertexai=True,
-            project=app.config['GCP_PROJECT'],
-            location=app.config['GCP_LOCATION']
-        )
-    except Exception as e:
-        print(f"WARNING: Could not initialize Vertex AI client. Gemini features will be mocked. Details: {e}")
-        return None
-
 valkey_client = get_valkey_connection()
-gemini_client = get_gemini_client()
 
 
-# --- MMR Reranking Helper ---
+# --- MMR Reranking Helper (No Changes) ---
 def mmr_rerank(query_embedding, candidate_embeddings, lambda_param=0.7, top_n=5):
     """Performs Maximal Marginal Relevance reranking to diversify results."""
     if not candidate_embeddings:
@@ -112,10 +126,11 @@ def mmr_rerank(query_embedding, candidate_embeddings, lambda_param=0.7, top_n=5)
     return selected_indices
 
 
-# --- Data Helpers ---
+# --- Data Helpers (No Changes) ---
 def get_user_profile(user_id):
     if not user_id:
         return None
+    # Assuming user IDs are prefixed for clarity, though not strictly required by HGETALL
     data = valkey_client.hgetall(f"user:{user_id}")
     if not data:
         return None
@@ -132,6 +147,7 @@ def get_products_by_ids(ids):
         return []
     pipe = valkey_client.pipeline(transaction=False)
     for pid in ids:
+        # Ensure the key is bytes, as hgetall expects byte strings
         key = pid if isinstance(pid, bytes) else pid.encode('utf-8')
         pipe.hgetall(key)
     results = pipe.execute()
@@ -154,50 +170,64 @@ def get_products_by_ids(ids):
         })
     return prods
 
+
 # --- Async LLM Descriptions ---
 def get_personalized_descriptions_async(user_profile, products):
     """
     Kicks off a SINGLE background thread that loops through products sequentially
-    to generate and cache their descriptions.
+    to generate and cache their descriptions using the configured AI backend.
     """
     def task():
-        if not gemini_client:
-            print("INFO: Gemini client not available, skipping description generation.")
+        ## --- DELTA START ---
+        if not ai_client:
+            print(f"INFO: AI client ({app.config['AI_MODE']}) not available, skipping description generation.")
             return
 
-        # This loop now runs sequentially within the single background thread
         for product in products:
             cache_key = f"llm_cache:user:{user_profile['id']}:product:{product['id']}"
             if valkey_client.exists(cache_key):
-                print(f"INFO: [Sequential] Cache hit for {cache_key}")
+                print(f"INFO: [Cache Hit] for {cache_key}")
                 continue
 
-            print(f"INFO: [Sequential] Cache miss for {cache_key}. Calling Gemini...")
+            print(f"INFO: [Cache Miss] for {cache_key}. Calling {app.config['AI_MODE']}...")
             prompt = (
                 f"You are a helpful and persuasive sales assistant. A user named {user_profile['name']} "
                 f"is considering the product: '{product['name']}'. Their bio is: '{user_profile['bio']}'. "
                 f"Write a short, personalized paragraph for this product that addresses their interests. No markdown."
             )
+            desc = None
+
             try:
-                response = gemini_client.models.generate_content(
-                    model=app.config['GEMINI_MODEL_NAME'],
-                    contents=[prompt]
-                )
-                desc = response.text if response and response.text else None
-                if not desc: raise ValueError("Received empty response from Gemini")
-                print(f"INFO: [Sequential] Gemini call SUCCESS for {cache_key}")
+                if app.config['AI_MODE'] == "GCP":
+                    response = ai_client.generate_content(
+                        model=app.config['LLM_MODEL_NAME'],
+                        contents=[prompt]
+                    )
+                    desc = response.text if response and response.text else None
+                elif app.config['AI_MODE'] == "LOCAL":
+                    response = ollama.generate(
+                        model=app.config['LLM_MODEL_NAME'],
+                        prompt=prompt
+                    )
+                    desc = response['response'] if response and response['response'] else None
+
+                if not desc: raise ValueError("Received empty response from LLM")
+                print(f"INFO: [{app.config['AI_MODE']} Success] for {cache_key}")
+
             except Exception as e:
-                print(f"WARNING: [Sequential] Gemini API call failed, using mock response. Details: {e}")
+                print(f"WARNING: [{app.config['AI_MODE']} API Call Failed] using mock response. Details: {e}")
                 desc = (
                     f"For an individual like {user_profile['name']}, the {product['name']} "
                     f"is a standout choice, aligning perfectly with your unique interests and needs."
                 )
             valkey_client.set(cache_key, desc, ex=7200)
+        ## --- DELTA END ---
 
     # Start the single background thread to run the task
     threading.Thread(target=task).start()
 
-# --- Routes ---
+
+# --- Routes (No structural changes, but logic now depends on dynamic config) ---
 @app.before_request
 def check_connection():
     if not valkey_client:
@@ -207,8 +237,8 @@ def check_connection():
 def login():
     if request.method == "POST":
         uid = request.form.get("user_id")
-        pwd = request.form.get("password")
-        if uid and pwd and get_user_profile(uid):
+        # Simple validation, in a real app this would be a proper password check
+        if uid and get_user_profile(uid):
             session["user_id"] = uid
             return redirect(url_for("home"))
         return render_template("login.html", error="Invalid user ID. Try 101 or 102.")
@@ -226,6 +256,7 @@ def home():
     if not uid:
         return redirect(url_for("login"))
     user = get_user_profile(uid)
+    # Get a small random sample of products for the homepage
     keys = list(valkey_client.scan_iter("product:*"))
     picks = random.sample(keys, min(5, len(keys)))
     products = get_products_by_ids(picks)
@@ -249,28 +280,25 @@ def search():
     q_str = f"({tag_filter})=>[KNN 25 @embedding $user_vec]"
     query_obj = (
         Query(q_str)
-        .return_fields("id", "embedding")
+        .return_fields("id") # Only need the ID for the first pass
         .dialect(2)
     )
     res = valkey_client.ft("products").search(query_obj, {"user_vec": user["embedding"]})
 
-    # Now that we have the IDs, we fetch the embeddings separately using a pipeline.
-    # HGETALL/HGET correctly returns raw bytes, avoiding the bug.
+    # Fetch embeddings for the candidates to perform reranking
     candidate_ids = [f"{doc.id}" for doc in res.docs]
     pipe = valkey_client.pipeline(transaction=False)
     for pid in candidate_ids:
-        pipe.hget(pid, "embedding")
+        pipe.hget(pid.encode('utf-8'), b"embedding")
     embedding_blobs = pipe.execute()
 
-    # Filter out any products that might not have an embedding
-    # and convert the valid byte blobs into numpy arrays
+    # Filter out any products without embeddings and convert blobs to numpy arrays
+    valid_candidate_ids = [
+        pid for pid, emb in zip(candidate_ids, embedding_blobs) if emb
+    ]
     candidate_embs = [
         np.frombuffer(emb, dtype=np.float32)
         for emb in embedding_blobs if emb
-    ]
-    # We also need to filter the IDs list to keep it in sync
-    valid_candidate_ids = [
-        pid for pid, emb in zip(candidate_ids, embedding_blobs) if emb
     ]
 
     if valid_candidate_ids and candidate_embs:
@@ -280,7 +308,7 @@ def search():
             lambda_param=0.7,
             top_n=5
         )
-        final_ids = [candidate_ids[i] for i in selected_indices]
+        final_ids = [valid_candidate_ids[i] for i in selected_indices]
         products = get_products_by_ids(final_ids)
     else:
         products = []
@@ -289,11 +317,12 @@ def search():
         get_personalized_descriptions_async(user, products)
     return render_template("home.html", user=user, products=products, search_query=query_text)
 
+
 @app.route("/stream/<cache_key>")
 def stream(cache_key):
     """
     This endpoint checks the Valkey cache repeatedly and streams the result
-    as soon as it's available.
+    as soon as it's available using Server-Sent Events (SSE).
     """
     def generate():
         # Try to get the cached result for up to 20 seconds
@@ -301,19 +330,17 @@ def stream(cache_key):
         while retries > 0:
             description = valkey_client.get(cache_key)
             if description:
-                # If found, send the data and close the connection
                 yield f"data: {json.dumps({'description': description.decode('utf-8')})}\n\n"
                 return
 
-            # Wait for 1 second before checking again
             time.sleep(1)
             retries -= 1
 
         # If the key never appears, send a timeout message
         yield f"data: {json.dumps({'description': 'Could not generate a personalized description at this time.'})}\n\n"
 
-    # Return a streaming response with the correct mimetype
     return Response(stream_with_context(generate()), mimetype="text/event-stream")
+
 
 @app.route("/product/<product_id>")
 def product_detail(product_id):
@@ -329,12 +356,12 @@ def product_detail(product_id):
 
     cache_key = f"llm_cache:user:{uid}:product:{product_id}"
     desc = valkey_client.get(cache_key)
-    # Check if the description is already in the cache. If not, start the async job.
     if not valkey_client.exists(cache_key):
         get_personalized_descriptions_async(user, [product])
 
     product['personalized_description'] = desc.decode() if desc else "A great choice that combines quality and value."
 
+    # Find similar products based on product embedding
     ft = valkey_client.ft("products")
     product_emb_bytes = valkey_client.hget(key.encode('utf-8'), "embedding")
 
@@ -342,17 +369,18 @@ def product_detail(product_id):
     if product_emb_bytes:
         q_prod = (Query("*=>[KNN 6 @embedding $product_vec]").return_field("id").dialect(2))
         res_sim = ft.search(q_prod, {"product_vec": product_emb_bytes})
-        sim_ids = [f"{d.id}" for d in res_sim.docs if d.id != product_id][:5]
+        sim_ids = [f"{d.id}" for d in res_sim.docs if d.id != key][:5] # Exclude self
         similar_products = get_products_by_ids(sim_ids)
         get_personalized_descriptions_async(user, similar_products)
 
+    # Find recommended products based on user embedding
     q_user = Query("*=>[KNN 25 @embedding $user_vec]").return_field("id").dialect(2)
     res_user = ft.search(q_user, {"user_vec": user["embedding"]})
 
     candidate_ids = []
     candidate_embs = []
     for d in res_user.docs:
-        if d.id == product_id:
+        if d.id == key: # Exclude current product from recommendations
             continue
         pid = f"{d.id}"
         e = valkey_client.hget(pid.encode('utf-8'), "embedding")
