@@ -39,7 +39,7 @@ docker run -d --rm --name valkey-demo -p 6379:6379 valkey/valkey-extensions
 docker ps
 ```
 
-You` should see valkey-demo in the list. To test the connection, run:
+You should see valkey-demo in the list. To test the connection, run:
 ```
 docker exec valkey-demo valkey-cli PING
 ```
@@ -98,7 +98,7 @@ set -x GCP_PROJECT "your-gcp-project-id"
 ```
 *(Replace your-gcp-project-id with your actual project ID)*
 
-**3\. Run the Data Loading Scripts**
+**3\. Run the Data Loading Script**
 
 You must run the script below  in order to populate the Valkey database. The scripts support connecting to both standalone and cluster Valkey servers using the \--cluster flag.
 
