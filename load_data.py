@@ -320,9 +320,9 @@ for index, persona in tqdm(df.iterrows(), total=df.shape[0], desc="Processing Pe
     try:
         if AI_MODE == "GCP":
             response = model.get_embeddings(texts_to_embed)
-            embedding_vectors = [item.values for item in response]
+            embedding_vector = [item.values for item in response][0]
         else: # LOCAL mode
-            embedding_vectors = model.encode(texts_to_embed, convert_to_numpy=True)
+            embedding_vector = model.encode(texts_to_embed, convert_to_numpy=True)
     except Exception as e:
         print(f"WARNING: Could not generate embedding for {user_id}. Using random vector. Details: {e}")
         embedding_vector = np.random.rand(768).astype(np.float32)
